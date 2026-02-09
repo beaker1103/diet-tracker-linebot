@@ -43,6 +43,13 @@ from pydantic_settings import BaseSettings
 from database import Database, MealRecord
 
 try:
+    from PIL import Image
+    from io import BytesIO as PILBytesIO
+    HAS_PILLOW = True
+except ImportError:
+    HAS_PILLOW = False
+
+try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -86,6 +93,10 @@ scheduler = AsyncIOScheduler()
 
 # 週報圖表快取（token -> PNG bytes，取用後刪除）
 chart_cache: dict = {}
+
+# Vision 分析用：圖片最長邊上限（px）、JPEG 品質（避免過大導致逾時或 API 拒絕）
+VISION_MAX_EDGE = 1024
+VISION_JPEG_QUALITY = 88
 
 
 @app.on_event("startup")
@@ -189,6 +200,28 @@ def handle_text_message(event):
         )
 
 
+def compress_image_for_vision(image_bytes: bytes) -> str:
+    """將圖片壓縮為適合作 Vision 的 JPEG base64，避免過大導致逾時或 API 錯誤。"""
+    if not HAS_PILLOW or not image_bytes:
+        return base64.b64encode(image_bytes).decode("utf-8")
+    try:
+        img = Image.open(PILBytesIO(image_bytes))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        w, h = img.size
+        if max(w, h) > VISION_MAX_EDGE:
+            ratio = VISION_MAX_EDGE / max(w, h)
+            new_size = (int(w * ratio), int(h * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+        buf = PILBytesIO()
+        img.save(buf, format="JPEG", quality=VISION_JPEG_QUALITY, optimize=True)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("utf-8")
+    except Exception as e:
+        logger.warning(f"圖片壓縮失敗，改用原圖: {e}")
+        return base64.b64encode(image_bytes).decode("utf-8")
+
+
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event):
     """處理圖片訊息 - 分析食物"""
@@ -203,10 +236,10 @@ def handle_image_message(event):
         if not image_data or len(image_data) == 0:
             raise ValueError("無法取得圖片內容")
         
-        # 轉換為 base64（支援 bytearray / bytes）
-        image_base64 = base64.b64encode(bytes(image_data)).decode("utf-8")
+        # 壓縮後轉 base64，再送 Vision（減少逾時與 API 限制問題）
+        image_base64 = compress_image_for_vision(bytes(image_data))
         
-        # 呼叫 GPT-5 Vision 分析
+        # 呼叫 Vision 分析（內含重試與備援模型）
         analysis = asyncio.run(analyze_food_image(image_base64))
         
         # 儲存到資料庫
@@ -234,8 +267,8 @@ def handle_image_message(event):
             )
     
     except Exception as e:
-        logger.exception("圖片分析失敗")
-        reply = build_error_message("分析失敗", str(e))
+        logger.exception("圖片分析失敗: %s", e)
+        reply = build_error_message("分析失敗")
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
             line_bot_api.reply_message(
@@ -246,65 +279,77 @@ def handle_image_message(event):
             )
 
 
+def _parse_vision_json(result_text: str) -> dict:
+    """從模型回覆中取出 JSON 並解析（支援 markdown 區塊或內文中的 JSON）。"""
+    text = (result_text or "").strip()
+    if "```" in text:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if m:
+            text = m.group(1).strip()
+    # 若仍非純 JSON，嘗試取出第一個 { ... } 區塊
+    obj_match = re.search(r"\{[\s\S]*\}", text)
+    if obj_match:
+        text = obj_match.group(0)
+    data = json.loads(text)
+    return {
+        "calories": float(data.get("calories", 0)),
+        "protein": float(data.get("protein", 0)),
+        "description": data.get("description", "未知食物"),
+    }
+
+
 async def analyze_food_image(image_base64: str) -> dict:
-    """使用 GPT-5 Vision 分析食物圖片"""
-    try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-5",
-            messages=[
-                {
-                    "role": "system",
-                    "content": """你是專業的營養師。分析圖片中的食物,估算:
+    """使用 Vision 模型分析食物圖片（逾時、重試、備援模型、穩健解析）。"""
+    system_content = """你是專業的營養師。分析圖片中的食物，估算:
 1. 總熱量(kcal)
 2. 蛋白質含量(g)
 3. 食物描述
 
-請以 JSON 格式回覆:
-{
-  "calories": 數字,
-  "protein": 數字,
-  "description": "詳細食物內容"
-}
+請「只」回覆一個 JSON 物件，不要其他說明：
+{"calories": 數字, "protein": 數字, "description": "詳細食物內容"}
 
-估算要準確,考慮份量大小。"""
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": "請分析這份餐點的熱量與蛋白質"
-                        }
-                    ]
-                }
-            ],
-            max_tokens=500,
-            temperature=0.3
-        )
-        
-        # 解析回應（可能被包在 ```json ... ``` 中）
-        result_text = (response.choices[0].message.content or "").strip()
-        if "```" in result_text:
-            match = re.search(r"```(?:json)?\s*([\s\S]*?)```", result_text)
-            if match:
-                result_text = match.group(1).strip()
-        result = json.loads(result_text)
-        
-        return {
-            "calories": float(result.get("calories", 0)),
-            "protein": float(result.get("protein", 0)),
-            "description": result.get("description", "未知食物")
-        }
-    
-    except Exception as e:
-        logger.error(f"GPT 分析錯誤: {e}")
-        raise
+估算要準確，考慮份量大小。"""
+    user_content = [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+        {"type": "text", "text": "請分析這份餐點的熱量與蛋白質，只回覆上述 JSON。"},
+    ]
+    models_to_try = ["gpt-5", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
+    last_error = None
+    for model in models_to_try:
+        for attempt in range(2):
+            try:
+                response = await openai_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": user_content},
+                    ],
+                    max_tokens=500,
+                    temperature=0.2,
+                    timeout=60.0,
+                )
+                result_text = (response.choices[0].message.content or "").strip()
+                if not result_text:
+                    raise ValueError("模型回覆為空")
+                return _parse_vision_json(result_text)
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON 解析失敗 ({model} attempt {attempt + 1}): {e}")
+                last_error = e
+                continue
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                if "model" in err_str or "not found" in err_str or "invalid" in err_str:
+                    break
+                if attempt < 1:
+                    await asyncio.sleep(1.0)
+                    continue
+                raise
+        if last_error and "model" in str(last_error).lower():
+            continue
+    if last_error:
+        raise last_error
+    raise RuntimeError("Vision 分析失敗")
 
 
 def format_analysis_reply(analysis: dict, today_total: dict) -> str:
@@ -499,16 +544,15 @@ async def prepare_weekly_chart(user_id: str) -> tuple:
 
 
 def build_error_message(title: str, detail: str = "") -> str:
-    """產生結構化、易讀的錯誤訊息"""
+    """產生結構化、易讀的錯誤訊息（不暴露內部錯誤給用戶）。"""
     lines = [
         "【" + title + "】",
         "",
         "可能原因：",
-        "  照片模糊或非食物畫面",
-        "  網路不穩，請稍後再試",
-        "  服務忙碌，請再傳一次",
+        "  服務暫時忙碌或連線逾時",
+        "  請再傳一次同一張照片，多數情況會成功。",
         "",
-        "若持續失敗，請稍後再試或換一張照片。",
+        "若多次失敗，可稍後再試或換一張照片。",
     ]
     if detail and "timeout" in detail.lower():
         lines.insert(-1, "  本次為連線逾時")
