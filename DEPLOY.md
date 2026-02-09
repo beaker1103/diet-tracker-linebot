@@ -87,7 +87,7 @@ git push
 | **Branch** | `main` |
 | **Runtime** | **Python 3** |
 | **Build Command** | `pip install -r requirements.txt` |
-| **Start Command** | `uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| **Start Command** | `python -m uvicorn main:app --host 0.0.0.0 --port $PORT` |
 
 **不要**勾選付費方案，維持免費。
 
