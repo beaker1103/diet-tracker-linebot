@@ -140,6 +140,25 @@ git push
 
 ---
 
+## 若出現「vicorn: command not found」
+
+Render 會以 **Dashboard 裡設定的 Start Command** 為準，不會自動從 `render.yaml` 更新。請在 Render 後台改一次：
+
+1. 登入 [Render Dashboard](https://dashboard.render.com/)
+2. 點進你的 **diet-tracker-linebot** 服務
+3. 左側選 **Settings**
+4. 找到 **Build & Deploy** 區塊的 **Start Command**
+5. 把內容改成（整行貼上）：
+   ```bash
+   python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+   ```
+6. 點 **Save Changes**
+7. 回到 **Manual Deploy** 或等自動 Deploy 完成
+
+之後啟動就會用 `python -m uvicorn`，不再出現 command not found。
+
+---
+
 ## 四、避免冷啟動（可選，建議做）
 
 免費方案約 **15 分鐘沒有請求** 會休眠，下次傳訊息可能要等 30–50 秒 Bot 才回。若希望一傳就回，可讓外部定期呼叫你的網址「保持喚醒」。
