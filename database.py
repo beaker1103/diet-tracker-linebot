@@ -5,6 +5,7 @@
 import ipaddress
 import json
 import os
+import re
 import socket
 import sqlite3
 from datetime import date, datetime
@@ -26,12 +27,60 @@ def _should_force_ipv4_for_postgres() -> bool:
     return os.getenv("RENDER", "").strip().lower() in ("true", "1", "yes")
 
 
-def _postgres_uri_with_ipv4_hostaddr(uri: str) -> str:
+def _ipv4_lookup(host: str) -> list:
+    try:
+        return socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return []
+
+
+def _conninfo_add_ipv4_hostaddr(params: dict) -> str | None:
+    """有 IPv4 A 記錄時加 hostaddr；成功回傳 conninfo 字串，否則 None。"""
+    from psycopg.conninfo import make_conninfo
+
+    host = (params.get("host") or "").strip()
+    if not host:
+        return None
+    infos = _ipv4_lookup(host)
+    if not infos:
+        return None
+    merged = dict(params)
+    merged["hostaddr"] = infos[0][4][0]
+    try:
+        return make_conninfo(**merged)
+    except Exception as e:
+        logger.warning("make_conninfo 失敗: %s", e)
+        return None
+
+
+def _supabase_direct_to_transaction_pooler(params: dict, ref: str) -> str | None:
     """
-    在連線參數加上 hostaddr=<IPv4>：TCP 走 IPv4，TLS 仍用原 host 驗證憑證。
-    使用 psycopg 解析 URI，避免 urllib 把主機名中的 [] 誤當成 IPv6 字面量
-    （例如誤貼成 @[Godwin30116002] 時會觸發 ValueError）。
+    db.<ref>.supabase.co 常僅有 IPv6。在 Render 上改連 Transaction pooler（有 IPv4）。
+    需設定 SUPABASE_REGION（例 ap-south-1）；或改用手動貼上的 pooler DATABASE_URL。
     """
+    from psycopg.conninfo import make_conninfo
+
+    region = (os.getenv("SUPABASE_REGION") or "").strip().lower().replace("_", "-")
+    if not region:
+        return None
+    custom = (os.getenv("SUPABASE_POOLER_HOST") or "").strip()
+    pooler_host = custom if custom else f"aws-0-{region}.pooler.supabase.com"
+    merged = dict(params)
+    merged["host"] = pooler_host
+    merged["port"] = 6543
+    merged["user"] = f"postgres.{ref}"
+    merged.pop("hostaddr", None)
+    try:
+        return make_conninfo(**merged)
+    except Exception as e:
+        logger.warning("Pooler make_conninfo 失敗: %s", e)
+        return None
+
+
+def _resolve_postgres_conninfo(uri: str) -> str:
+    if not _should_force_ipv4_for_postgres():
+        return uri
+
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
     try:
@@ -51,31 +100,40 @@ def _postgres_uri_with_ipv4_hostaddr(uri: str) -> str:
         pass
 
     if params.get("hostaddr"):
+        try:
+            return make_conninfo(**dict(params))
+        except Exception:
+            return uri
+
+    # Supabase Direct：常無 IPv4，只能走 pooler 或加 hostaddr（若有 A 記錄）
+    m = re.fullmatch(r"db\.([a-z0-9]+)\.supabase\.co", host, re.I)
+    if m:
+        ref = m.group(1)
+        ci = _conninfo_add_ipv4_hostaddr(params)
+        if ci:
+            logger.info("PostgreSQL 已套用 IPv4 hostaddr（%s）", host)
+            return ci
+        pool = _supabase_direct_to_transaction_pooler(params, ref)
+        if pool:
+            logger.warning(
+                "Supabase Direct（%s）無 IPv4，已自動改用 Transaction pooler（6543）。",
+                host,
+            )
+            return pool
+        logger.error(
+            "資料庫 %s 沒有 IPv4（Render 無法使用 IPv6）。"
+            "請在 Render 新增環境變數 SUPABASE_REGION=你的區域（本專案為 ap-south-1），"
+            "或到 Supabase Connect 複製 Transaction pooler 的 URI 設為 DATABASE_URL。",
+            host,
+        )
         return uri
 
-    try:
-        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
-    except OSError as e:
-        logger.warning("無法解析 %s 的 IPv4: %s，沿用原始 DATABASE_URL", host, e)
-        return uri
-    if not infos:
-        return uri
-
-    merged = dict(params)
-    merged["hostaddr"] = infos[0][4][0]
-    try:
-        return make_conninfo(**merged)
-    except Exception as e:
-        logger.warning("make_conninfo 失敗: %s", e)
-        return uri
-
-
-def _resolve_postgres_conninfo(uri: str) -> str:
-    if _should_force_ipv4_for_postgres():
-        new_uri = _postgres_uri_with_ipv4_hostaddr(uri)
-        if new_uri != uri:
-            logger.info("PostgreSQL 已套用 IPv4 hostaddr（Render 或 DATABASE_FORCE_IPV4）")
-        return new_uri
+    # 其他主機：僅嘗試 hostaddr
+    ci = _conninfo_add_ipv4_hostaddr(params)
+    if ci:
+        logger.info("PostgreSQL 已套用 IPv4 hostaddr")
+        return ci
+    logger.warning("無法解析 %s 的 IPv4，沿用原始 DATABASE_URL", host)
     return uri
 
 
