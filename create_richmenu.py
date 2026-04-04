@@ -43,10 +43,10 @@ def create_rich_menu():
                 # │  欺騙日   │  AI教練   │  今日總計  │
                 # └───────────┴───────────┴───────────┘
 
-                # 左上: 購買查詢
+                # 左上: 食物查詢（與 main.py「購買查詢」流程相同）
                 RichMenuArea(
                     bounds=RichMenuBounds(x=0, y=0, width=833, height=843),
-                    action=MessageAction(label="購買查詢", text="購買查詢"),
+                    action=MessageAction(label="食物查詢", text="食物查詢"),
                 ),
                 # 中上: 本週積分
                 RichMenuArea(
@@ -68,10 +68,10 @@ def create_rich_menu():
                     bounds=RichMenuBounds(x=834, y=843, width=833, height=843),
                     action=MessageAction(label="AI教練", text="AI教練"),
                 ),
-                # 右下: 今日總計
+                # 右下: 今日總結（與 main.py「今日」相同）
                 RichMenuArea(
                     bounds=RichMenuBounds(x=1667, y=843, width=833, height=843),
-                    action=MessageAction(label="今日", text="今日"),
+                    action=MessageAction(label="今日總結", text="今日總結"),
                 ),
             ],
         )

@@ -1000,12 +1000,12 @@ HELP_TEXT = (
     "  「清除今日」- 刪除今日所有紀錄\n"
     "  「說明」- 顯示此說明\n\n"
     "圖文選單功能:\n"
-    "  「購買查詢」- 買之前先查熱量等級\n"
-    "  「本週積分」- 本週飲食控制成績\n"
+    "  「食物查詢」/「購買查詢」- 買之前先查熱量等級\n"
+    "  「本週積分」/「週報」- 本週飲食控制成績\n"
     "  「上傳InBody」- 更新體組成數據\n"
     "  「欺騙日」- 啟動欺騙日模式\n"
     "  「AI教練」- 取得個人化建議\n"
-    "  「今日」- 今日飲食總結"
+    "  「今日總結」/「今日」- 今日飲食總結"
 )
 
 
@@ -1100,7 +1100,7 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
         if text in ("說明", "幫助", "help", "Help", "HELP"):
             return HELP_TEXT
 
-        if text in ("今日", "今日總計", "總計", "今天"):
+        if text in ("今日", "今日總計", "今日總結", "總計", "今天"):
             return await handle_today_summary(user_id)
 
         if text == "清除今日":
@@ -1108,7 +1108,7 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
             count = db.clear_today(user_id, today_str)
             return f"已清除今日 {count} 筆紀錄。"
 
-        if text in ("購買查詢", "查詢", "買之前"):
+        if text in ("購買查詢", "食物查詢", "查詢", "買之前"):
             set_state(user_id, UserState.WAITING_PURCHASE_PHOTO)
             return (
                 "購買前熱量查詢已啟動\n"
@@ -1118,7 +1118,7 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
                 "輸入「取消」可結束查詢。"
             )
 
-        if text in ("本週積分", "積分", "積分卡", "本週"):
+        if text in ("本週積分", "積分", "積分卡", "本週", "週報"):
             return await handle_weekly_score(user_id)
 
         if text in ("上傳InBody", "InBody", "inbody", "INBODY"):
