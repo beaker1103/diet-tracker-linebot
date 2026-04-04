@@ -1,6 +1,6 @@
 """
-產生圖文選單圖片 (2500 x 1686)
-使用 Pillow 繪製,不需外部圖片素材。
+產生圖文選單圖片（2500 x 1686）
+使用 Pillow 繪製，不需外部圖片素材。
 """
 
 from PIL import Image, ImageDraw, ImageFont
