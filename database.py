@@ -2,13 +2,13 @@
 資料庫模組：支援 SQLite（本機，未設 DATABASE_URL）與 PostgreSQL（Supabase 等）。
 """
 
+import ipaddress
 import json
 import os
 import socket
 import sqlite3
 from datetime import date, datetime
 from typing import Optional
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import logging
 
 logger = logging.getLogger(__name__)
@@ -28,13 +28,31 @@ def _should_force_ipv4_for_postgres() -> bool:
 
 def _postgres_uri_with_ipv4_hostaddr(uri: str) -> str:
     """
-    在 URI 加上 hostaddr=<IPv4>：TCP 走 IPv4，TLS 仍用原 hostname 驗證憑證。
-    Supabase direct 主機常解析到 IPv6，在 Render 會出現 Network is unreachable。
+    在連線參數加上 hostaddr=<IPv4>：TCP 走 IPv4，TLS 仍用原 host 驗證憑證。
+    使用 psycopg 解析 URI，避免 urllib 把主機名中的 [] 誤當成 IPv6 字面量
+    （例如誤貼成 @[Godwin30116002] 時會觸發 ValueError）。
     """
-    parsed = urlparse(uri)
-    host = parsed.hostname
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    try:
+        params = conninfo_to_dict(uri)
+    except Exception as e:
+        logger.warning("DATABASE_URL 解析失敗: %s", e)
+        return uri
+
+    host = (params.get("host") or "").strip()
     if not host:
         return uri
+
+    try:
+        ipaddress.ip_address(host)
+        return uri
+    except ValueError:
+        pass
+
+    if params.get("hostaddr"):
+        return uri
+
     try:
         infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
     except OSError as e:
@@ -42,21 +60,14 @@ def _postgres_uri_with_ipv4_hostaddr(uri: str) -> str:
         return uri
     if not infos:
         return uri
-    ipv4 = infos[0][4][0]
-    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    if q.get("hostaddr"):
+
+    merged = dict(params)
+    merged["hostaddr"] = infos[0][4][0]
+    try:
+        return make_conninfo(**merged)
+    except Exception as e:
+        logger.warning("make_conninfo 失敗: %s", e)
         return uri
-    q["hostaddr"] = ipv4
-    return urlunparse(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            urlencode(q),
-            parsed.fragment,
-        )
-    )
 
 
 def _resolve_postgres_conninfo(uri: str) -> str:
