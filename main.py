@@ -6,6 +6,7 @@ FastAPI + LINE Messaging API + OpenAI GPT Vision
 import os
 import json
 import base64
+import hmac
 import logging
 import asyncio
 from io import BytesIO
@@ -888,43 +889,45 @@ async def handle_today_summary(user_id: str) -> str:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 定時推播 (每晚 23:00)
+# 定時推播（建議由 GitHub Actions 呼叫 /cron/daily-summary）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def daily_summary_job():
-    """每晚 23:00 推播當日總結。"""
+async def execute_daily_summary_push() -> dict:
+    """推播今日有紀錄用戶的每日總結（可重複呼叫）。"""
+    today_str = date.today().isoformat()
+    user_ids = db.get_active_users_today(today_str)
+    ok, fail = 0, 0
+    configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+    async with AsyncApiClient(configuration) as api_client:
+        line_api = AsyncMessagingApi(api_client)
+        for uid in user_ids:
+            try:
+                summary = await handle_today_summary(uid)
+                await line_api.push_message(
+                    PushMessageRequest(
+                        to=uid,
+                        messages=[TextMessage(text=truncate_line_text(summary))],
+                    )
+                )
+                ok += 1
+                logger.info("已推播每日總結給 %s...", uid[:8])
+            except Exception as e:
+                fail += 1
+                logger.error("推播失敗 %s: %s", uid[:8], e)
+    return {"date": today_str, "users": len(user_ids), "pushed_ok": ok, "pushed_fail": fail}
+
+
+async def daily_summary_job_internal():
+    """僅在 ENABLE_INTERNAL_DAILY_CRON=1 時啟用：進程內每晚 23:00 推播。"""
     while True:
         now = datetime.now()
-        # 計算到今晚 23:00 的秒數
         target = now.replace(hour=23, minute=0, second=0, microsecond=0)
         if now >= target:
             target += timedelta(days=1)
         wait_seconds = (target - now).total_seconds()
-
-        logger.info(f"下次推播在 {wait_seconds:.0f} 秒後 ({target})")
+        logger.info("內建排程：下次推播在 %.0f 秒後 (%s)", wait_seconds, target)
         await asyncio.sleep(wait_seconds)
-
-        # 取得所有今日有紀錄的使用者
-        today_str = date.today().isoformat()
-        user_ids = db.get_active_users_today(today_str)
-
-        configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-        async with AsyncApiClient(configuration) as api_client:
-            line_api = AsyncMessagingApi(api_client)
-            for uid in user_ids:
-                try:
-                    summary = await handle_today_summary(uid)
-                    await line_api.push_message(
-                        PushMessageRequest(
-                            to=uid,
-                            messages=[TextMessage(text=summary)],
-                        )
-                    )
-                    logger.info(f"已推播每日總結給 {uid[:8]}...")
-                except Exception as e:
-                    logger.error(f"推播失敗 {uid[:8]}: {e}")
-
-        # 等一分鐘避免重複觸發
+        await execute_daily_summary_push()
         await asyncio.sleep(60)
 
 
@@ -934,12 +937,16 @@ async def daily_summary_job():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """應用生命週期: 啟動背景任務。"""
+    """應用生命週期：初始化 DB；可選內建 23:00 排程。"""
     db.init()
-    task = asyncio.create_task(daily_summary_job())
+    task = None
+    if os.getenv("ENABLE_INTERNAL_DAILY_CRON") == "1":
+        task = asyncio.create_task(daily_summary_job_internal())
+        logger.info("已啟用進程內每日 23:00 推播")
     logger.info("Bot 啟動完成")
     yield
-    task.cancel()
+    if task:
+        task.cancel()
 
 
 app = FastAPI(title="Diet Tracker LINE Bot", lifespan=lifespan)
@@ -1168,6 +1175,26 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
         )
 
     return ""
+
+
+@app.get("/ping")
+async def ping():
+    """給 UptimeRobot 等監控每幾分鐘 GET，避免 Render 閒置休眠。"""
+    return {"status": "ok"}
+
+
+@app.post("/cron/daily-summary")
+async def cron_daily_summary(request: Request):
+    """給 GitHub Actions 定時 POST；標頭 X-Cron-Secret 須與環境變數 CRON_SECRET 相同。"""
+    secret = os.getenv("CRON_SECRET", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="CRON_SECRET 未設定")
+    got = request.headers.get("X-Cron-Secret", "")
+    ga, gb = got.encode("utf-8"), secret.encode("utf-8")
+    if len(ga) != len(gb) or not hmac.compare_digest(ga, gb):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    result = await execute_daily_summary_push()
+    return JSONResponse(content=result)
 
 
 @app.get("/health")

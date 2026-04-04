@@ -1,0 +1,28 @@
+# 台灣時間每天 23:00 觸發 Render 上的每日推播（UTC 15:00，無夏令時間）
+# 請在 GitHub repo → Settings → Secrets and variables → Actions 設定：
+#   RENDER_CRON_URL = https://你的服務.onrender.com/cron/daily-summary
+#   CRON_SECRET     = 與 Render 環境變數 CRON_SECRET 相同的長隨機字串
+
+name: Daily LINE summary
+
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+
+jobs:
+  trigger-render-cron:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST daily-summary
+        env:
+          URL: ${{ secrets.RENDER_CRON_URL }}
+          SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$URL" ] || [ -z "$SECRET" ]; then
+            echo "::error::請設定 Actions secrets：RENDER_CRON_URL、CRON_SECRET"
+            exit 1
+          fi
+          curl -sS -f -X POST "$URL" \
+            -H "X-Cron-Secret: $SECRET" \
+            -H "Content-Type: application/json"
