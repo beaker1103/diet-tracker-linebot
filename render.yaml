@@ -16,7 +16,7 @@ services:
         value: "3.12.8"
       - key: DATABASE_URL
         sync: false
-      # Supabase Direct（db.xxx.supabase.co）在 Render 常無 IPv4；設區域可自動改連 pooler:6543
+      # Supabase Direct 在 Render 常無 IPv4；設區域可自動改連 Session pooler :5432
       - key: SUPABASE_REGION
         sync: false
       - key: CRON_SECRET

@@ -53,10 +53,12 @@ def _conninfo_add_ipv4_hostaddr(params: dict) -> str | None:
         return None
 
 
-def _supabase_direct_to_transaction_pooler(params: dict, ref: str) -> str | None:
+def _supabase_direct_to_session_pooler(params: dict, ref: str) -> str | None:
     """
-    db.<ref>.supabase.co 常僅有 IPv6。在 Render 上改連 Transaction pooler（有 IPv4）。
-    需設定 SUPABASE_REGION（例 ap-south-1）；或改用手動貼上的 pooler DATABASE_URL。
+    db.<ref>.supabase.co（Direct）常僅有 IPv6。改連 Supavisor「Session pooler」（IPv4）：
+    使用者 postgres.<ref>、主機 aws-0-<region>.pooler.supabase.com、port 5432。
+    （勿把 6543 配在 pooler 主機上；6543 是 db.xxx.supabase.co 的 Transaction 模式，使用者為 postgres。）
+    見: https://supabase.com/docs/guides/database/connecting-to-postgres
     """
     from psycopg.conninfo import make_conninfo
 
@@ -67,7 +69,7 @@ def _supabase_direct_to_transaction_pooler(params: dict, ref: str) -> str | None
     pooler_host = custom if custom else f"aws-0-{region}.pooler.supabase.com"
     merged = dict(params)
     merged["host"] = pooler_host
-    merged["port"] = 6543
+    merged["port"] = 5432
     merged["user"] = f"postgres.{ref}"
     merged.pop("hostaddr", None)
     try:
@@ -75,6 +77,14 @@ def _supabase_direct_to_transaction_pooler(params: dict, ref: str) -> str | None
     except Exception as e:
         logger.warning("Pooler make_conninfo 失敗: %s", e)
         return None
+
+
+def _supabase_pooler_aws1_fallback_conninfo(failed_conninfo: str) -> str | None:
+    """部分專案掛在 aws-1-* pooler；Tenant not found 時改試 aws-1。"""
+    if "aws-0-" not in failed_conninfo or ".pooler.supabase.com" not in failed_conninfo:
+        return None
+    alt = failed_conninfo.replace("aws-0-", "aws-1-", 1)
+    return alt if alt != failed_conninfo else None
 
 
 def _resolve_postgres_conninfo(uri: str) -> str:
@@ -113,17 +123,18 @@ def _resolve_postgres_conninfo(uri: str) -> str:
         if ci:
             logger.info("PostgreSQL 已套用 IPv4 hostaddr（%s）", host)
             return ci
-        pool = _supabase_direct_to_transaction_pooler(params, ref)
+        pool = _supabase_direct_to_session_pooler(params, ref)
         if pool:
             logger.warning(
-                "Supabase Direct（%s）無 IPv4，已自動改用 Transaction pooler（6543）。",
+                "Supabase Direct（%s）無 IPv4，已自動改用 Session pooler（5432，使用者 postgres.%s）。",
                 host,
+                ref,
             )
             return pool
         logger.error(
             "資料庫 %s 沒有 IPv4（Render 無法使用 IPv6）。"
-            "請在 Render 新增環境變數 SUPABASE_REGION=你的區域（本專案為 ap-south-1），"
-            "或到 Supabase Connect 複製 Transaction pooler 的 URI 設為 DATABASE_URL。",
+            "請在 Render 設定 SUPABASE_REGION=你的區域（例 ap-south-1），"
+            "或到 Supabase Connect 複製「Session pooler」URI 設為 DATABASE_URL。",
             host,
         )
         return uri
@@ -151,14 +162,31 @@ class Database:
     def _connect(self):
         if self._pg:
             import psycopg
+            from psycopg import OperationalError
             from psycopg.rows import dict_row
 
+            timeout = int(os.getenv("DATABASE_CONNECT_TIMEOUT", "15"))
             conninfo = _resolve_postgres_conninfo(self._database_url)
-            return psycopg.connect(
-                conninfo,
-                row_factory=dict_row,
-                connect_timeout=int(os.getenv("DATABASE_CONNECT_TIMEOUT", "15")),
-            )
+            try:
+                return psycopg.connect(
+                    conninfo,
+                    row_factory=dict_row,
+                    connect_timeout=timeout,
+                )
+            except OperationalError as e:
+                err = str(e)
+                if "Tenant or user not found" in err:
+                    alt = _supabase_pooler_aws1_fallback_conninfo(conninfo)
+                    if alt:
+                        logger.warning(
+                            "Pooler 回傳 Tenant not found，改試 aws-1 pooler 主機"
+                        )
+                        return psycopg.connect(
+                            alt,
+                            row_factory=dict_row,
+                            connect_timeout=timeout,
+                        )
+                raise
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
