@@ -13,7 +13,7 @@ services:
     autoDeployTrigger: commit
     envVars:
       - key: PYTHON_VERSION
-        value: "3.12.8"
+        value: "3.12.0"
       - key: LINE_CHANNEL_SECRET
         sync: false
       - key: LINE_CHANNEL_ACCESS_TOKEN
