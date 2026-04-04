@@ -10,7 +10,8 @@ import hmac
 import logging
 import asyncio
 from io import BytesIO
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
 import httpx
 from dotenv import load_dotenv
@@ -1049,6 +1050,113 @@ async def execute_daily_summary_push() -> dict:
     return {"date": today_str, "users": len(user_ids), "pushed_ok": ok, "pushed_fail": fail}
 
 
+def _utc_range_local_midnight_to(
+    local_day: date, end_local: time, tz: ZoneInfo
+) -> tuple[str, str]:
+    """當地日期的 00:00 起至 end_local（不含）止，轉成 UTC ISO 區間 [start, end)。"""
+    start_local = datetime.combine(local_day, time(0, 0), tzinfo=tz)
+    end_local = datetime.combine(local_day, end_local, tzinfo=tz)
+    return (
+        start_local.astimezone(timezone.utc).isoformat(),
+        end_local.astimezone(timezone.utc).isoformat(),
+    )
+
+
+def _next_meal_reminder_fire_utc(now_utc: datetime, tz: ZoneInfo) -> tuple[datetime, str]:
+    """下次觸發的 UTC 時刻與時段 noon／evening。"""
+    now_local = now_utc.astimezone(tz)
+    d = now_local.date()
+    noon_local = datetime.combine(d, time(12, 30), tzinfo=tz)
+    eve_local = datetime.combine(d, time(20, 0), tzinfo=tz)
+    cands: list[tuple[datetime, str]] = []
+    if now_local < noon_local:
+        cands.append((noon_local.astimezone(timezone.utc), "noon"))
+    if now_local < eve_local:
+        cands.append((eve_local.astimezone(timezone.utc), "evening"))
+    if not cands:
+        d2 = d + timedelta(days=1)
+        n2 = datetime.combine(d2, time(12, 30), tzinfo=tz)
+        cands.append((n2.astimezone(timezone.utc), "noon"))
+    return min(cands, key=lambda x: x[0])
+
+
+async def execute_meal_reminder_push(slot: str) -> dict:
+    """12:30 中午／20:00 晚上：該時點前若當地當日尚無任何 LINE 訊息則推播一句。"""
+    tzname = (os.getenv("BOT_TIMEZONE") or "Asia/Taipei").strip()
+    tz = ZoneInfo(tzname)
+    now_local = datetime.now(timezone.utc).astimezone(tz)
+    local_date = now_local.date()
+    local_date_s = local_date.isoformat()
+
+    if slot == "noon":
+        start_iso, end_iso = _utc_range_local_midnight_to(
+            local_date, time(12, 30), tz
+        )
+        text = "中午吃什麼～"
+    else:
+        start_iso, end_iso = _utc_range_local_midnight_to(
+            local_date, time(20, 0), tz
+        )
+        text = "晚餐吃什麼～"
+
+    meal_since = (local_date - timedelta(days=400)).isoformat()
+    user_ids = db.get_user_ids_for_meal_reminders(meal_since)
+    ok, skip, fail = 0, 0, 0
+    configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+    async with AsyncApiClient(configuration) as api_client:
+        line_api = AsyncMessagingApi(api_client)
+        for uid in user_ids:
+            try:
+                if db.user_had_message_in_utc_range(uid, start_iso, end_iso):
+                    skip += 1
+                    continue
+                if db.reminder_already_sent(uid, local_date_s, slot):
+                    skip += 1
+                    continue
+                await line_api.push_message(
+                    PushMessageRequest(
+                        to=uid,
+                        messages=[TextMessage(text=text)],
+                    )
+                )
+                db.mark_reminder_sent(uid, local_date_s, slot)
+                ok += 1
+                logger.info("已推播用餐提醒（%s）給 %s...", slot, uid[:8])
+            except Exception as e:
+                fail += 1
+                logger.error("用餐提醒推播失敗 %s: %s", uid[:8], e)
+    return {
+        "slot": slot,
+        "date": local_date_s,
+        "users": len(user_ids),
+        "pushed_ok": ok,
+        "skipped": skip,
+        "pushed_fail": fail,
+    }
+
+
+async def meal_reminder_job_internal():
+    """進程內排程：依 BOT_TIMEZONE 每日 12:30、20:00 觸發。"""
+    tzname = (os.getenv("BOT_TIMEZONE") or "Asia/Taipei").strip()
+    tz = ZoneInfo(tzname)
+    logger.info("用餐提醒排程時區：%s", tzname)
+    while True:
+        now = datetime.now(timezone.utc)
+        fire_utc, slot = _next_meal_reminder_fire_utc(now, tz)
+        wait_sec = (fire_utc - now).total_seconds()
+        logger.info(
+            "用餐提醒：下次觸發 %s（約 %.0f 秒後）",
+            slot,
+            max(0, wait_sec),
+        )
+        await asyncio.sleep(max(1.0, wait_sec))
+        try:
+            await execute_meal_reminder_push(slot)
+        except Exception:
+            logger.exception("用餐提醒批次失敗")
+        await asyncio.sleep(3)
+
+
 async def daily_summary_job_internal():
     """僅在 ENABLE_INTERNAL_DAILY_CRON=1 時啟用：進程內每晚 23:00 推播。"""
     while True:
@@ -1069,16 +1177,19 @@ async def daily_summary_job_internal():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """應用生命週期：初始化 DB；可選內建 23:00 排程。"""
+    """應用生命週期：初始化 DB；可選內建 23:00 與用餐提醒排程。"""
     db.init()
-    task = None
+    bg_tasks: list[asyncio.Task] = []
     if os.getenv("ENABLE_INTERNAL_DAILY_CRON") == "1":
-        task = asyncio.create_task(daily_summary_job_internal())
+        bg_tasks.append(asyncio.create_task(daily_summary_job_internal()))
         logger.info("已啟用進程內每日 23:00 推播")
+    if os.getenv("ENABLE_INTERNAL_MEAL_REMINDERS", "1") != "0":
+        bg_tasks.append(asyncio.create_task(meal_reminder_job_internal()))
+        logger.info("已啟用進程內 12:30／20:00 用餐提醒")
     logger.info("Bot 啟動完成")
     yield
-    if task:
-        task.cancel()
+    for t in bg_tasks:
+        t.cancel()
 
 
 app = FastAPI(title="Diet Tracker LINE Bot", lifespan=lifespan)
@@ -1159,6 +1270,7 @@ async def webhook(request: Request):
                 continue
 
             user_id = event.source.user_id
+            db.log_line_message(user_id, datetime.now(timezone.utc).isoformat())
             reply_token = event.reply_token
             state = get_state(user_id)
 

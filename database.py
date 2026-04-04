@@ -8,7 +8,7 @@ import os
 import re
 import socket
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
 import logging
 
@@ -267,6 +267,22 @@ class Database:
                     ON purchase_queries(user_id, timestamp);
                 CREATE INDEX IF NOT EXISTS idx_weekly_user
                     ON weekly_scores(user_id, week_start);
+
+                CREATE TABLE IF NOT EXISTS user_message_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    at_utc TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_msg_log_user_at
+                    ON user_message_log(user_id, at_utc);
+
+                CREATE TABLE IF NOT EXISTS reminder_sent (
+                    user_id TEXT NOT NULL,
+                    local_date TEXT NOT NULL,
+                    slot TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, local_date, slot)
+                );
             """)
             conn.commit()
             logger.info("SQLite 資料庫初始化完成")
@@ -330,6 +346,19 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_cheat_user_date ON cheat_days(user_id, date)",
             "CREATE INDEX IF NOT EXISTS idx_purchase_user ON purchase_queries(user_id, timestamp)",
             "CREATE INDEX IF NOT EXISTS idx_weekly_user ON weekly_scores(user_id, week_start)",
+            """CREATE TABLE IF NOT EXISTS user_message_log (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                at_utc TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_user_msg_log_user_at ON user_message_log(user_id, at_utc)",
+            """CREATE TABLE IF NOT EXISTS reminder_sent (
+                user_id TEXT NOT NULL,
+                local_date TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, local_date, slot)
+            )""",
         ]
         conn = self._connect()
         try:
@@ -647,6 +676,113 @@ class Database:
                             date.today().isoformat(),
                         ),
                     )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ━━━ 用餐提醒（LINE 訊息時間軸）━━━
+
+    def log_line_message(self, user_id: str, at_utc: str | None = None):
+        """記錄使用者曾傳入任一則訊息（供用餐提醒判斷當日是否已互動）。"""
+        ts = at_utc or datetime.now(timezone.utc).isoformat()
+        sql = self._adapt(
+            "INSERT INTO user_message_log (user_id, at_utc) VALUES (?, ?)"
+        )
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (user_id, ts))
+            else:
+                conn.execute(sql, (user_id, ts))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def user_had_message_in_utc_range(
+        self, user_id: str, start_iso: str, end_iso: str
+    ) -> bool:
+        """是否有訊息記錄落在 [start_iso, end_iso)（ISO 字串，建議 UTC）。"""
+        sql = self._adapt(
+            """SELECT 1 FROM user_message_log
+               WHERE user_id = ? AND at_utc >= ? AND at_utc < ?
+               LIMIT 1"""
+        )
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (user_id, start_iso, end_iso))
+                    row = cur.fetchone()
+            else:
+                row = conn.execute(sql, (user_id, start_iso, end_iso)).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def get_user_ids_for_meal_reminders(self, meal_since_date: str) -> list[str]:
+        """曾傳過訊息，或近期有餐點紀錄的使用者（去重）。"""
+        conn = self._connect()
+        try:
+            if self._pg:
+                sql = """
+                    SELECT DISTINCT user_id FROM (
+                        SELECT user_id FROM user_message_log
+                        UNION
+                        SELECT DISTINCT user_id FROM meals WHERE created_date >= %s
+                    ) AS u
+                """
+                with conn.cursor() as cur:
+                    cur.execute(sql, (meal_since_date,))
+                    rows = cur.fetchall()
+            else:
+                sql = """
+                    SELECT DISTINCT user_id FROM (
+                        SELECT user_id FROM user_message_log
+                        UNION
+                        SELECT user_id FROM meals WHERE created_date >= ?
+                    ) AS u
+                """
+                rows = conn.execute(sql, (meal_since_date,)).fetchall()
+            return [self._row_to_dict(r)["user_id"] for r in rows]
+        finally:
+            conn.close()
+
+    def reminder_already_sent(self, user_id: str, local_date: str, slot: str) -> bool:
+        sql = self._adapt(
+            """SELECT 1 FROM reminder_sent
+               WHERE user_id = ? AND local_date = ? AND slot = ? LIMIT 1"""
+        )
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (user_id, local_date, slot))
+                    row = cur.fetchone()
+            else:
+                row = conn.execute(sql, (user_id, local_date, slot)).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def mark_reminder_sent(self, user_id: str, local_date: str, slot: str):
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        try:
+            if self._pg:
+                sql = (
+                    "INSERT INTO reminder_sent (user_id, local_date, slot, created_at) "
+                    "VALUES (%s, %s, %s, %s) ON CONFLICT (user_id, local_date, slot) DO NOTHING"
+                )
+                with conn.cursor() as cur:
+                    cur.execute(sql, (user_id, local_date, slot, now))
+            else:
+                conn.execute(
+                    """INSERT OR IGNORE INTO reminder_sent
+                       (user_id, local_date, slot, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (user_id, local_date, slot, now),
+                )
             conn.commit()
         finally:
             conn.close()
