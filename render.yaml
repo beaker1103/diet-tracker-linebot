@@ -13,7 +13,7 @@ services:
     autoDeployTrigger: commit
     envVars:
       - key: PYTHON_VERSION
-        value: "3.12.0"
+        value: "3.12.8"
       - key: DATABASE_URL
         sync: false
       - key: CRON_SECRET
