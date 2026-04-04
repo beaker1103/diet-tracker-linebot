@@ -4,14 +4,68 @@
 
 import json
 import os
+import socket
 import sqlite3
 from datetime import date, datetime
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import logging
 
 logger = logging.getLogger(__name__)
 
 DB_PATH = "diet_tracker.db"
+
+
+def _should_force_ipv4_for_postgres() -> bool:
+    """Render 等環境常無法連 Supabase 的 IPv6；設 DATABASE_FORCE_IPV4=0 可關閉。"""
+    v = os.getenv("DATABASE_FORCE_IPV4", "").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return os.getenv("RENDER", "").strip().lower() in ("true", "1", "yes")
+
+
+def _postgres_uri_with_ipv4_hostaddr(uri: str) -> str:
+    """
+    在 URI 加上 hostaddr=<IPv4>：TCP 走 IPv4，TLS 仍用原 hostname 驗證憑證。
+    Supabase direct 主機常解析到 IPv6，在 Render 會出現 Network is unreachable。
+    """
+    parsed = urlparse(uri)
+    host = parsed.hostname
+    if not host:
+        return uri
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as e:
+        logger.warning("無法解析 %s 的 IPv4: %s，沿用原始 DATABASE_URL", host, e)
+        return uri
+    if not infos:
+        return uri
+    ipv4 = infos[0][4][0]
+    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if q.get("hostaddr"):
+        return uri
+    q["hostaddr"] = ipv4
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(q),
+            parsed.fragment,
+        )
+    )
+
+
+def _resolve_postgres_conninfo(uri: str) -> str:
+    if _should_force_ipv4_for_postgres():
+        new_uri = _postgres_uri_with_ipv4_hostaddr(uri)
+        if new_uri != uri:
+            logger.info("PostgreSQL 已套用 IPv4 hostaddr（Render 或 DATABASE_FORCE_IPV4）")
+        return new_uri
+    return uri
 
 
 class Database:
@@ -30,7 +84,12 @@ class Database:
             import psycopg
             from psycopg.rows import dict_row
 
-            return psycopg.connect(self._database_url, row_factory=dict_row)
+            conninfo = _resolve_postgres_conninfo(self._database_url)
+            return psycopg.connect(
+                conninfo,
+                row_factory=dict_row,
+                connect_timeout=int(os.getenv("DATABASE_CONNECT_TIMEOUT", "15")),
+            )
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
