@@ -131,6 +131,34 @@ def _openai_extract_message_text(data: dict) -> str:
         return ""
 
 
+class OpenAIUserNotice(str):
+    """標記為應直接顯示給使用者的 OpenAI 連線／帳務錯誤說明（非模型回傳文字）。"""
+
+
+def _openai_error_user_message(status: int, body: str) -> str | None:
+    try:
+        data = json.loads(body or "{}")
+    except json.JSONDecodeError:
+        return None
+    err = data.get("error")
+    if not isinstance(err, dict):
+        return None
+    code = str(err.get("code") or "")
+    typ = str(err.get("type") or "")
+    if typ == "insufficient_quota" or code == "insufficient_quota":
+        return (
+            "目前無法使用 AI 分析，OpenAI 帳戶額度或方案已不足。"
+            "請至 OpenAI 平台檢查方案與帳單，充值或升級後再試。"
+        )
+    if status == 401:
+        return "無法連線 AI 服務，API 金鑰無效或已撤銷。請聯絡管理員檢查設定。"
+    if status == 429:
+        return "目前請求過於頻繁或服務忙碌，請稍後再試。"
+    if status >= 500:
+        return "AI 服務暫時無法使用，請稍後再試。"
+    return None
+
+
 async def call_openai_vision(
     system_prompt: str,
     user_prompt: str,
@@ -140,7 +168,7 @@ async def call_openai_vision(
     """呼叫 OpenAI Vision API，回傳解析後的 JSON 或原始文字。"""
     if not OPENAI_API_KEY:
         logger.error("OPENAI_API_KEY 未設定")
-        return ""
+        return OpenAIUserNotice("AI 服務未設定，請聯絡管理員檢查環境變數。")
 
     # 組裝 user content
     user_content = []
@@ -182,6 +210,9 @@ async def call_openai_vision(
                 resp.status_code,
                 (resp.text or "")[:800],
             )
+            um = _openai_error_user_message(resp.status_code, resp.text or "")
+            if um:
+                return OpenAIUserNotice(um)
         resp.raise_for_status()
 
     raw = _openai_extract_message_text(resp.json())
@@ -206,7 +237,7 @@ async def call_openai_text(system_prompt: str, user_prompt: str) -> dict | str:
     """呼叫 OpenAI 文字 API (無圖片)。"""
     if not OPENAI_API_KEY:
         logger.error("OPENAI_API_KEY 未設定")
-        return ""
+        return OpenAIUserNotice("AI 服務未設定，請聯絡管理員檢查環境變數。")
 
     payload = {
         "model": OPENAI_MODEL,
@@ -234,6 +265,9 @@ async def call_openai_text(system_prompt: str, user_prompt: str) -> dict | str:
                 resp.status_code,
                 (resp.text or "")[:800],
             )
+            um = _openai_error_user_message(resp.status_code, resp.text or "")
+            if um:
+                return OpenAIUserNotice(um)
         resp.raise_for_status()
 
     raw = _openai_extract_message_text(resp.json())
@@ -463,6 +497,8 @@ async def handle_meal_photo(user_id: str, message_id: str) -> str:
         image_base64=image_b64,
     )
 
+    if isinstance(result, OpenAIUserNotice):
+        return str(result)
     if isinstance(result, str):
         return f"分析失敗，請重新拍照。\n\n原始回應：\n{result[:200]}"
 
@@ -508,6 +544,9 @@ async def handle_purchase_query_photo(user_id: str, message_id: str) -> str:
         image_base64=image_b64,
     )
 
+    if isinstance(result, OpenAIUserNotice):
+        clear_state(user_id)
+        return str(result)
     if isinstance(result, str):
         clear_state(user_id)
         return f"分析失敗，請重新拍照。\n\n原始回應：\n{result[:200]}"
@@ -572,6 +611,9 @@ async def handle_inbody_photo(user_id: str, message_id: str) -> str:
         image_base64=image_b64,
     )
 
+    if isinstance(result, OpenAIUserNotice):
+        clear_state(user_id)
+        return str(result)
     if isinstance(result, str):
         clear_state(user_id)
         return f"InBody 分析失敗，請確認照片清晰度。\n\n{result[:200]}"
@@ -870,6 +912,8 @@ async def handle_ai_coach(user_id: str) -> str:
         user_prompt=f"以下是使用者的飲食數據，請進行分析：\n{json.dumps(data_summary, ensure_ascii=False, indent=2)}",
     )
 
+    if isinstance(result, OpenAIUserNotice):
+        return str(result)
     if isinstance(result, str):
         return f"AI 教練分析完成：\n\n{result}"
 
