@@ -29,6 +29,9 @@ class NotionSync:
         self.daily_db_id = (os.getenv("NOTION_DAILY_DB_ID") or "").strip()
         self.inbody_db_id = (os.getenv("NOTION_INBODY_DB_ID") or "").strip()
         self.sync_user_id = (os.getenv("NOTION_SYNC_USER_ID") or "").strip()
+        # 資料庫第一欄必為 Title；Notion 常顯示為 Name，可重新命名或在這裡指定 API 欄位名
+        self.daily_title_prop = (os.getenv("NOTION_DAILY_TITLE_PROP") or "日期").strip() or "日期"
+        self.inbody_title_prop = (os.getenv("NOTION_INBODY_TITLE_PROP") or "檢測日期").strip() or "檢測日期"
         self._client = None
         if token and self.daily_db_id and self.inbody_db_id:
             try:
@@ -76,7 +79,7 @@ class NotionSync:
             achieved = pro >= protein_target * 0.9 if protein_target > 0 else False
 
             properties = {
-                "日期": {"title": [{"text": {"content": date_str}}]},
+                self.daily_title_prop: {"title": [{"text": {"content": date_str}}]},
                 "熱量": {"number": round(cal, 1)},
                 "蛋白質": {"number": round(pro, 1)},
                 "碳水化合物": {"number": round(carbs, 1)},
@@ -132,7 +135,7 @@ class NotionSync:
             muscle_num = round(float(muscle), 1) if muscle is not None else None
 
             properties: dict = {
-                "檢測日期": {"title": [{"text": {"content": str(test_date)}}]},
+                self.inbody_title_prop: {"title": [{"text": {"content": str(test_date)}}]},
                 "體重": {"number": round(w, 1)},
                 "體脂率": {"number": round(bf, 1)},
                 "骨骼肌": {"number": muscle_num},
@@ -157,7 +160,7 @@ class NotionSync:
             results = self._client.databases.query(
                 database_id=self.daily_db_id,
                 filter={
-                    "property": "日期",
+                    "property": self.daily_title_prop,
                     "title": {"equals": date_str},
                 },
             )
@@ -171,7 +174,7 @@ class NotionSync:
         try:
             results = self._client.databases.query(
                 database_id=self.inbody_db_id,
-                sorts=[{"property": "檢測日期", "direction": "descending"}],
+                sorts=[{"property": self.inbody_title_prop, "direction": "descending"}],
                 page_size=1,
             )
             rows = results.get("results") or []
