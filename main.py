@@ -31,6 +31,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
 
 from database import Database
+from notion_sync import get_notion_sync
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 設定
@@ -668,6 +669,23 @@ async def handle_inbody_photo(user_id: str, message_id: str) -> str:
 
     clear_state(user_id)
 
+    notion = get_notion_sync()
+    if notion.should_sync_line_user(user_id):
+        td = result.get("test_date")
+        if not td or str(td).lower() == "null":
+            td = date.today().isoformat()
+        inbody_payload = {
+            "test_date": str(td),
+            "weight": weight,
+            "body_fat_percentage": bf,
+            "muscle_mass": muscle,
+            "bmr": bmr,
+        }
+        try:
+            await asyncio.to_thread(notion.sync_inbody, inbody_payload)
+        except Exception as ne:
+            logger.error("Notion InBody 同步失敗（仍會回覆 LINE）: %s", ne)
+
     lines = [
         "InBody 數據已更新",
         "=" * 24,
@@ -1030,11 +1048,33 @@ async def execute_daily_summary_push() -> dict:
     today_str = date.today().isoformat()
     user_ids = db.get_active_users_today(today_str)
     ok, fail = 0, 0
+    notion = get_notion_sync()
     configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
     async with AsyncApiClient(configuration) as api_client:
         line_api = AsyncMessagingApi(api_client)
         for uid in user_ids:
             try:
+                if notion.should_sync_line_user(uid):
+                    totals = db.get_daily_totals(uid, today_str)
+                    if totals.get("meal_count", 0) > 0:
+                        targets = get_user_targets(uid)
+                        try:
+                            await asyncio.to_thread(
+                                notion.sync_daily_nutrition,
+                                today_str,
+                                {
+                                    **totals,
+                                    "carbs": 0.0,
+                                    "fat": 0.0,
+                                },
+                                float(targets["protein"]),
+                            )
+                        except Exception as ne:
+                            logger.error(
+                                "Notion 每日同步失敗（仍會推播 LINE）%s: %s",
+                                uid[:8],
+                                ne,
+                            )
                 summary = await handle_today_summary(uid)
                 await line_api.push_message(
                     PushMessageRequest(
