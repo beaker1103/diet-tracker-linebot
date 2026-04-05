@@ -223,7 +223,8 @@ class Database:
                     daily_protein_target INTEGER DEFAULT 300,
                     last_inbody_date TEXT,
                     created_at TEXT,
-                    updated_at TEXT
+                    updated_at TEXT,
+                    custom_quick_items TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS cheat_days (
@@ -288,6 +289,29 @@ class Database:
             logger.info("SQLite 資料庫初始化完成")
         finally:
             conn.close()
+        self._migrate_user_profiles_quick_items()
+
+    def _migrate_user_profiles_quick_items(self):
+        """舊資料庫補上 user_profiles.custom_quick_items。"""
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS custom_quick_items TEXT"
+                    )
+                conn.commit()
+            else:
+                try:
+                    conn.execute(
+                        "ALTER TABLE user_profiles ADD COLUMN custom_quick_items TEXT"
+                    )
+                    conn.commit()
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+        finally:
+            conn.close()
 
     def _init_postgres(self):
         stmts = [
@@ -310,7 +334,8 @@ class Database:
                 daily_protein_target INTEGER DEFAULT 300,
                 last_inbody_date TEXT,
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                custom_quick_items TEXT
             )""",
             """CREATE TABLE IF NOT EXISTS cheat_days (
                 id SERIAL PRIMARY KEY,
@@ -369,6 +394,7 @@ class Database:
             logger.info("PostgreSQL 資料庫初始化完成")
         finally:
             conn.close()
+        self._migrate_user_profiles_quick_items()
 
     def _row_to_dict(self, row):
         if row is None:
@@ -480,6 +506,66 @@ class Database:
             conn.close()
 
     # ━━━ 使用者檔案 ━━━
+
+    def update_custom_quick_items(self, user_id: str, items_json: str):
+        """儲存使用者自訂快速記錄品項（JSON 字串）。"""
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        try:
+            sel = self._adapt("SELECT user_id FROM user_profiles WHERE user_id = ?")
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sel, (user_id,))
+                    existing = cur.fetchone()
+                    if existing:
+                        upd = self._adapt(
+                            """UPDATE user_profiles
+                               SET custom_quick_items = ?, updated_at = ?
+                               WHERE user_id = ?"""
+                        )
+                        cur.execute(upd, (items_json, now, user_id))
+                    else:
+                        ins = self._adapt(
+                            """INSERT INTO user_profiles
+                               (user_id, custom_quick_items, daily_calorie_target,
+                                daily_protein_target, created_at, updated_at)
+                               VALUES (?, ?, ?, ?, ?, ?)"""
+                        )
+                        cur.execute(
+                            ins,
+                            (
+                                user_id,
+                                items_json,
+                                2500,
+                                300,
+                                now,
+                                now,
+                            ),
+                        )
+            else:
+                existing = conn.execute(sel, (user_id,)).fetchone()
+                if existing:
+                    conn.execute(
+                        self._adapt(
+                            """UPDATE user_profiles
+                               SET custom_quick_items = ?, updated_at = ?
+                               WHERE user_id = ?"""
+                        ),
+                        (items_json, now, user_id),
+                    )
+                else:
+                    conn.execute(
+                        self._adapt(
+                            """INSERT INTO user_profiles
+                               (user_id, custom_quick_items, daily_calorie_target,
+                                daily_protein_target, created_at, updated_at)
+                               VALUES (?, ?, ?, ?, ?, ?)"""
+                        ),
+                        (user_id, items_json, 2500, 300, now, now),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_user_profile(self, user_id: str) -> Optional[dict]:
         sql = self._adapt("SELECT * FROM user_profiles WHERE user_id = ?")

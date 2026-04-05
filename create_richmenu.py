@@ -38,7 +38,7 @@ def create_rich_menu():
             chat_bar_text="點擊開啟功能選單",
             areas=[
                 # ┌───────────┬───────────┬───────────┐
-                # │  購買查詢  │ 本週積分   │  InBody   │
+                # │  購買查詢  │ 加蛋白飲   │  InBody   │
                 # ├───────────┼───────────┼───────────┤
                 # │  欺騙日   │  AI教練   │  今日總計  │
                 # └───────────┴───────────┴───────────┘
@@ -48,10 +48,10 @@ def create_rich_menu():
                     bounds=RichMenuBounds(x=0, y=0, width=833, height=843),
                     action=MessageAction(label="食物查詢", text="食物查詢"),
                 ),
-                # 中上: 本週積分
+                # 中上: 快速加蛋白飲（本週積分改為文字指令）
                 RichMenuArea(
                     bounds=RichMenuBounds(x=834, y=0, width=833, height=843),
-                    action=MessageAction(label="本週積分", text="本週積分"),
+                    action=MessageAction(label="加蛋白飲", text="加蛋白飲"),
                 ),
                 # 右上: InBody
                 RichMenuArea(

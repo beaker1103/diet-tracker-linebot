@@ -4,6 +4,7 @@ FastAPI + LINE Messaging API + OpenAI GPT Vision
 """
 
 import os
+import re
 import json
 import base64
 import hmac
@@ -59,6 +60,13 @@ GENERAL_GRADES = ["S", "A", "B", "C", "D", "E"]
 
 DEFAULT_PROTEIN_TARGET = 300  # g
 DEFAULT_CALORIE_TARGET = 2500  # kcal
+
+# 快速記錄（不呼叫 Vision，省 token）；可經「設定蛋白飲」自訂蛋白飲數值
+DEFAULT_QUICK_ITEMS = {
+    "蛋白飲": {"calories": 130, "protein": 25, "description": "乳清蛋白飲 一份"},
+    "雞蛋": {"calories": 75, "protein": 6, "description": "水煮蛋 一顆"},
+    "雞胸肉": {"calories": 165, "protein": 31, "description": "雞胸肉 100g"},
+}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -350,22 +358,31 @@ async def get_line_image_base64(message_id: str) -> str:
 # 提示詞定義
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-PROMPT_MEAL_ANALYSIS = """你是專業的營養師。分析圖片中的食物，精確估算營養數據。
+PROMPT_MEAL_ANALYSIS = """你是專業的營養師，專門為減脂客戶提供飲食分析。
 
-規則：
-- 畫面中若有手部、手臂或背景，僅為使用者持握或擺放食物，請完全忽略，專注在食物與包裝上的文字與營養標示
-- 若有繁體中文營養標示表，優先依標示上的每份或每100公克數值填寫熱量與蛋白質（必要時換算）
-- 仔細觀察食物份量、容器大小、食材組成
-- 考慮烹調方式對熱量的影響（油炸 > 煎 > 烤 > 蒸 > 水煮）
-- 如果是包裝食品，盡量辨識品牌與標示；不得以「無法辨識人物」為由拒絕分析
-- 不要使用任何 emoji
-- 使用繁體中文
+核心原則：熱量寧可高估，不可低估（蛋白質維持合理、不偏高一併高估）。
+- 若你判斷熱量範圍約 300～450 kcal，回報的單一數字應接近上限（例如 420～450），而非中位數
+- 若份量模糊，假設較大份量；醬料、油脂、隱藏熱量一律算入
+- 飲料的糖與加料按「合理範圍內較高」估算
+- 外食餐廳份量通常比家常料理多約 20～30％，熱量一併反映
+- 炸物、勾芡、焗烤等高油烹調，在合理範圍內額外多加約 15～20％ 熱量
+
+估算步驟：
+1. 先判斷食物種類與份量
+2. 估算合理熱量區間（最低～最高）
+3. 回報的 calories 取該區間約 75～85 百分位（偏上），不要取中位
+4. 蛋白質以正常專業方式估算即可，不需刻意偏高
+
+畫面若有手部或背景，僅為持握食物，請忽略；有包裝營養標示時，熱量仍以減脂保守原則為準（標示為參考，可因實際食用量略調高）。
+
+不要使用任何 emoji。使用繁體中文。
 
 請嚴格以下列 JSON 格式回覆，不要有其他文字：
 {
   "calories": 數字,
   "protein": 數字,
-  "description": "食物內容的簡要描述"
+  "description": "食物內容的簡要描述",
+  "estimation_note": "簡短說明為何給這個熱量數字，例如：已含醬汁與用油、採區間上緣估算"
 }"""
 
 PROMPT_PURCHASE_QUERY = """你是專業的營養師與食品分析師。分析圖片中的食物或商品包裝，提供購買前的完整評估。
@@ -513,13 +530,101 @@ def get_gap_filler(remaining_protein: float) -> str:
         return f"還缺 {remaining_protein:.0f}g——建議在剩餘餐次中優先選擇高蛋白食物。"
 
 
+def _load_custom_quick_items(user_id: str) -> dict | None:
+    profile = db.get_user_profile(user_id)
+    if not profile:
+        return None
+    raw = profile.get("custom_quick_items")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+async def handle_quick_protein(user_id: str, item_name: str = "蛋白飲") -> str:
+    """快速記錄固定品項，不呼叫 OpenAI。"""
+    today_str = date.today().isoformat()
+    custom = _load_custom_quick_items(user_id)
+
+    if custom and item_name in custom:
+        item = custom[item_name]
+    elif item_name in DEFAULT_QUICK_ITEMS:
+        item = DEFAULT_QUICK_ITEMS[item_name]
+    else:
+        return f"找不到「{item_name}」的快速記錄資料。"
+
+    try:
+        cal = float(item["calories"])
+        pro = float(item["protein"])
+    except (KeyError, TypeError, ValueError):
+        return f"「{item_name}」資料格式異常，請用「設定蛋白飲」重新設定。"
+    desc = str(item.get("description", item_name))
+
+    db.add_meal(user_id, cal, pro, f"[快速記錄] {desc}", today_str)
+
+    totals = db.get_daily_totals(user_id, today_str)
+    targets = get_user_targets(user_id)
+    remaining = targets["protein"] - totals["protein"]
+    bar = build_progress_bar(totals["protein"], targets["protein"])
+    gap = get_gap_filler(remaining)
+
+    return (
+        f"已記錄：{desc}\n"
+        f"  ＋{cal:.0f} kcal／＋{pro:.0f} g 蛋白質\n"
+        f"{'=' * 24}\n"
+        f"今日累計：\n"
+        f"  總熱量：{totals['calories']:.0f} kcal\n"
+        f"  總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g\n"
+        f"  {bar}\n\n"
+        f"{gap}"
+    )
+
+
+def handle_set_quick_item(user_id: str, text: str) -> str:
+    """解析「設定蛋白飲 130 25」並寫入自訂 JSON。"""
+    numbers = re.findall(r"\d+", text)
+    if len(numbers) < 2:
+        return (
+            "設定格式：\n"
+            "  設定蛋白飲 [熱量] [蛋白質]\n\n"
+            "範例：\n"
+            "  設定蛋白飲 130 25\n"
+            "  （一份 130 kcal、25 g 蛋白質）\n\n"
+            "目前預設：130 kcal／25 g"
+        )
+
+    cal = int(numbers[0])
+    pro = int(numbers[1])
+    if cal > 2000 or pro > 200 or cal < 1 or pro < 1:
+        return "數值異常，請確認單位為 kcal 與 g（熱量 1～2000，蛋白質 1～200）。"
+
+    custom = _load_custom_quick_items(user_id) or {}
+    custom["蛋白飲"] = {
+        "calories": cal,
+        "protein": pro,
+        "description": "乳清蛋白飲 一份（自訂）",
+    }
+    db.update_custom_quick_items(
+        user_id, json.dumps(custom, ensure_ascii=False)
+    )
+
+    return (
+        f"蛋白飲數值已更新：\n"
+        f"  熱量：{cal} kcal\n"
+        f"  蛋白質：{pro} g\n\n"
+        f"之後傳「加蛋白飲」會使用此數值記錄。"
+    )
+
+
 async def handle_meal_photo(user_id: str, message_id: str) -> str:
     """處理食物照片：分析＋記錄＋回傳摘要。"""
     image_b64 = await get_line_image_base64(message_id)
 
     result = await call_openai_vision(
         system_prompt=PROMPT_MEAL_ANALYSIS,
-        user_prompt="請分析這份餐點的熱量與蛋白質。",
+        user_prompt="請分析這份餐點。目標為減脂，熱量請依提示採保守偏高估算；蛋白質正常估算。",
         image_base64=image_b64,
     )
 
@@ -531,6 +636,7 @@ async def handle_meal_photo(user_id: str, message_id: str) -> str:
     cal = float(result.get("calories", 0))
     pro = float(result.get("protein", 0))
     desc = result.get("description", "無法辨識")
+    note = (result.get("estimation_note") or "").strip()
 
     # 寫入 DB
     today_str = date.today().isoformat()
@@ -544,20 +650,28 @@ async def handle_meal_photo(user_id: str, message_id: str) -> str:
     bar = build_progress_bar(totals["protein"], targets["protein"])
     gap = get_gap_filler(remaining)
 
-    return (
-        f"本餐分析結果\n"
-        f"{'=' * 24}\n"
-        f"食物內容：\n{desc}\n\n"
-        f"營養數據：\n"
-        f"  熱量：{cal:.0f} kcal\n"
-        f"  蛋白質：{pro:.0f} g\n\n"
-        f"{'=' * 24}\n"
-        f"今日累計：\n"
-        f"  總熱量：{totals['calories']:.0f} kcal\n"
-        f"  總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g\n"
-        f"  {bar}\n\n"
-        f"{gap}"
-    )
+    lines = [
+        "本餐分析結果",
+        "=" * 24,
+        f"食物內容：\n{desc}",
+        "",
+        "營養數據（減脂保守估計）：",
+        f"  熱量：{cal:.0f} kcal",
+        f"  蛋白質：{pro:.0f} g",
+    ]
+    if note:
+        lines.append(f"  說明：{note}")
+    lines.extend([
+        "",
+        "=" * 24,
+        "今日累計：",
+        f"  總熱量：{totals['calories']:.0f} kcal",
+        f"  總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g",
+        f"  {bar}",
+        "",
+        gap,
+    ])
+    return "\n".join(lines)
 
 
 async def handle_purchase_query_photo(user_id: str, message_id: str) -> str:
@@ -1277,18 +1391,22 @@ HELP_TEXT = (
     "減重監測 Bot 使用說明\n"
     "=" * 24 + "\n\n"
     "基本操作：\n"
-    "  拍照傳食物，將自動分析並記錄。\n\n"
+    "  拍照傳食物，將自動分析並記錄（熱量為減脂保守估計）。\n\n"
     "文字指令：\n"
     "  「今日」：查看今日總結\n"
     "  「清除今日」：刪除今日所有紀錄\n"
+    "  「本週積分」「週報」「積分卡」等：本週飲食成績\n"
+    "  「設定蛋白飲 熱量 蛋白質」：自訂快速記錄數值（例：設定蛋白飲 130 25）\n"
     "  「說明」：顯示此說明\n\n"
-    "圖文選單功能：\n"
-    "  「食物查詢」或「購買查詢」：買之前先查熱量等級\n"
-    "  「本週積分」或「週報」：本週飲食控制成績\n"
-    "  「上傳InBody」：更新體組成數據\n"
-    "  「欺騙日」：啟動欺騙日模式\n"
-    "  「AI教練」：取得個人化建議\n"
-    "  「今日總結」或「今日」：今日飲食總結"
+    "圖文選單：\n"
+    "  「食物查詢」或「購買查詢」：買前先查熱量等級\n"
+    "  「加蛋白飲」：一鍵記錄一份蛋白飲（不耗 AI）\n"
+    "  「上傳InBody」：更新體組成\n"
+    "  「欺騙日」「AI教練」「今日總結」：同字面\n\n"
+    "快速記錄（不耗 token）：\n"
+    "  「加蛋白飲」「蛋白飲」「＋蛋白」\n"
+    "  「加雞蛋」「＋雞蛋」\n"
+    "  「加雞胸肉」「＋雞胸肉」"
 )
 
 
@@ -1391,6 +1509,18 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
             today_str = date.today().isoformat()
             count = db.clear_today(user_id, today_str)
             return f"已清除今日 {count} 筆紀錄。"
+
+        if text.startswith("設定蛋白飲"):
+            return handle_set_quick_item(user_id, text)
+
+        if text in ("加蛋白飲", "蛋白飲", "+蛋白飲", "+蛋白", "＋蛋白飲", "＋蛋白"):
+            return await handle_quick_protein(user_id, "蛋白飲")
+
+        if text in ("加雞蛋", "+雞蛋", "＋雞蛋"):
+            return await handle_quick_protein(user_id, "雞蛋")
+
+        if text in ("加雞胸肉", "+雞胸肉", "＋雞胸肉"):
+            return await handle_quick_protein(user_id, "雞胸肉")
 
         if text in ("購買查詢", "食物查詢", "查詢", "買之前"):
             set_state(user_id, UserState.WAITING_PURCHASE_PHOTO)
