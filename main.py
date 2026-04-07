@@ -592,17 +592,24 @@ async def handle_quick_protein(user_id: str, item_name: str = "蛋白飲") -> st
     totals = db.get_daily_totals(user_id, today_str)
     targets = get_user_targets(user_id)
     remaining = targets["protein"] - totals["protein"]
+    remaining_cal = targets["calories"] - totals["calories"]
+    remaining_cal_line = (
+        f"剩餘熱量：約 {remaining_cal:.0f} kcal"
+        if remaining_cal >= 0
+        else f"熱量狀態：已超過目標約 {-remaining_cal:.0f} kcal"
+    )
     bar = build_progress_bar(totals["protein"], targets["protein"])
     gap = get_gap_filler(remaining)
 
     return (
         f"已記錄：{desc}\n"
-        f"  ＋{cal:.0f} kcal／＋{pro:.0f} g 蛋白質\n"
-        f"{'=' * 24}\n"
+        f"＋{cal:.0f} kcal／＋{pro:.0f} g 蛋白質\n"
+        f"————\n"
         f"今日累計：\n"
-        f"  總熱量：{totals['calories']:.0f} kcal\n"
-        f"  總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g\n"
-        f"  {bar}\n\n"
+        f"總熱量：{totals['calories']:.0f} kcal\n"
+        f"{remaining_cal_line}\n"
+        f"總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g\n"
+        f"{bar}\n\n"
         f"{gap}"
     )
 
@@ -671,28 +678,34 @@ async def handle_meal_photo(user_id: str, message_id: str) -> str:
     totals = db.get_daily_totals(user_id, today_str)
     targets = get_user_targets(user_id)
     remaining = targets["protein"] - totals["protein"]
-
+    remaining_cal = targets["calories"] - totals["calories"]
+    remaining_cal_line = (
+        f"剩餘熱量：約 {remaining_cal:.0f} kcal"
+        if remaining_cal >= 0
+        else f"熱量狀態：已超過目標約 {-remaining_cal:.0f} kcal"
+    )
     bar = build_progress_bar(totals["protein"], targets["protein"])
     gap = get_gap_filler(remaining)
 
     lines = [
         "本餐分析結果",
-        "=" * 24,
+        "————",
         f"食物內容：\n{desc}",
         "",
         "營養數據（減脂保守估計）：",
-        f"  熱量：{cal:.0f} kcal",
-        f"  蛋白質：{pro:.0f} g",
+        f"熱量：{cal:.0f} kcal",
+        f"蛋白質：{pro:.0f} g",
     ]
     if note:
-        lines.append(f"  說明：{note}")
+        lines.append(f"說明：{note}")
     lines.extend([
         "",
-        "=" * 24,
+        "————",
         "今日累計：",
-        f"  總熱量：{totals['calories']:.0f} kcal",
-        f"  總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g",
-        f"  {bar}",
+        f"總熱量：{totals['calories']:.0f} kcal",
+        remaining_cal_line,
+        f"總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g",
+        f"{bar}",
         "",
         gap,
     ])
@@ -1223,7 +1236,7 @@ async def handle_today_summary(user_id: str) -> str:
     lines = [
         f"今日飲食總結 ({today_str})",
         f"{'[欺騙日模式]' if is_cheat else ''}",
-        "=" * 24,
+        "————",
         "",
         f"總熱量：{totals['calories']:.0f}／{cal_target:.0f} kcal",
         remaining_cal_line,
@@ -1234,8 +1247,8 @@ async def handle_today_summary(user_id: str) -> str:
     ]
 
     for i, meal in enumerate(meals, 1):
-        lines.append(f"  {i}. {meal['food_description']}")
-        lines.append(f"     {meal['calories']:.0f} kcal／{meal['protein']:.0f}g 蛋白質")
+        lines.append(f"{i}. {meal['food_description']}")
+        lines.append(f"{meal['calories']:.0f} kcal／{meal['protein']:.0f}g 蛋白質")
 
     lines.append("")
     lines.append(get_gap_filler(remaining_protein))
@@ -1459,20 +1472,57 @@ async def push_line_text(user_id: str, text: str):
         )
 
 
+async def push_line_text_with_retry(user_id: str, text: str, attempts: int = 3):
+    """Push 失敗時短暫重試，降低網路抖動造成的漏訊。"""
+    last_err: Exception | None = None
+    for i in range(attempts):
+        try:
+            await push_line_text(user_id, text)
+            return
+        except Exception as e:
+            last_err = e
+            logger.warning("push 嘗試 %s/%s 失敗: %s", i + 1, attempts, e)
+            await asyncio.sleep(0.8 * (i + 1))
+    if last_err:
+        raise last_err
+
+
+async def _analyze_image_by_state(user_id: str, message_id: str, state_at_receive: str) -> str:
+    if state_at_receive == UserState.WAITING_PURCHASE_PHOTO:
+        return await handle_purchase_query_photo(user_id, message_id)
+    if state_at_receive == UserState.WAITING_INBODY_PHOTO:
+        return await handle_inbody_photo(user_id, message_id)
+    return await handle_meal_photo(user_id, message_id)
+
+
 async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_receive: str):
     """背景執行：下載、壓縮、Vision、寫入 DB，完成後 push 結果。"""
+    timeout_sec = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "150"))
+    logger.info(
+        "圖片分析開始 user=%s msg=%s state=%s timeout=%.0fs",
+        user_id[:8],
+        message_id,
+        state_at_receive,
+        timeout_sec,
+    )
     try:
-        if state_at_receive == UserState.WAITING_PURCHASE_PHOTO:
-            body = await handle_purchase_query_photo(user_id, message_id)
-        elif state_at_receive == UserState.WAITING_INBODY_PHOTO:
-            body = await handle_inbody_photo(user_id, message_id)
-        else:
-            body = await handle_meal_photo(user_id, message_id)
+        body = await asyncio.wait_for(
+            _analyze_image_by_state(user_id, message_id, state_at_receive),
+            timeout=timeout_sec,
+        )
+        logger.info("圖片分析完成 user=%s msg=%s", user_id[:8], message_id)
+    except asyncio.TimeoutError:
+        logger.error("圖片分析逾時 user=%s msg=%s", user_id[:8], message_id)
+        body = (
+            "本次圖片分析耗時過長，已自動中止。\n"
+            "請重新傳一次照片（盡量清晰、只拍重點），我會立即重跑。"
+        )
     except Exception as e:
         logger.error("背景圖片分析失敗: %s", e, exc_info=True)
         body = "分析過程發生錯誤，請稍後再試或重新傳送照片。"
     try:
-        await push_line_text(user_id, body)
+        await push_line_text_with_retry(user_id, body, attempts=3)
+        logger.info("圖片分析結果已推送 user=%s msg=%s", user_id[:8], message_id)
     except Exception as e:
         logger.error("Push 分析結果失敗: %s", e, exc_info=True)
 
@@ -1528,6 +1578,12 @@ async def webhook(request: Request):
 
             try:
                 if isinstance(event.message, ImageMessageContent):
+                    logger.info(
+                        "收到圖片訊息 user=%s msg=%s state=%s",
+                        user_id[:8],
+                        event.message.id,
+                        state,
+                    )
                     reply_text = "已收到照片，正在分析中…"
                     snap_state = get_state(user_id)
                     asyncio.create_task(
@@ -1711,6 +1767,12 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
 async def ping():
     """給 UptimeRobot 等監控每幾分鐘 GET，避免 Render 閒置休眠。"""
     return {"status": "ok"}
+
+
+@app.head("/ping")
+async def ping_head():
+    """允許 HEAD 探活，避免 405 噪音。"""
+    return JSONResponse(content=None, status_code=200)
 
 
 @app.post("/cron/daily-summary")
