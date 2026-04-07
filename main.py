@@ -58,7 +58,7 @@ FOOD_GRADES = ["ㄅ", "ㄆ", "ㄇ", "ㄈ", "ㄉ"]
 # 通用評分 (用於其他所有功能)
 GENERAL_GRADES = ["S", "A", "B", "C", "D", "E"]
 
-DEFAULT_PROTEIN_TARGET = 300  # g
+DEFAULT_PROTEIN_TARGET = 220  # g（無 InBody 時兜底；有體重時由 calculate_targets 重算）
 DEFAULT_CALORIE_TARGET = 2500  # kcal
 
 # 快速記錄（不呼叫 Vision，省 token）；可經「設定蛋白飲」自訂蛋白飲數值
@@ -513,14 +513,32 @@ def build_progress_bar(current: float, target: float, width: int = 20) -> str:
 
 
 def get_user_targets(user_id: str) -> dict:
-    """取得使用者的每日目標 (從 DB 或使用預設值)。"""
+    """取得使用者的每日目標。
+
+    只要 profile 有體重，一律用 calculate_targets 依體重／體脂／BMR 重算，
+    不再沿用 DB 裡可能過舊的 daily_*_target（例如先前寫入的 300g）。
+    """
     profile = db.get_user_profile(user_id)
-    if profile:
-        return {
-            "calories": profile.get("daily_calorie_target", DEFAULT_CALORIE_TARGET),
-            "protein": profile.get("daily_protein_target", DEFAULT_PROTEIN_TARGET),
-        }
-    return {"calories": DEFAULT_CALORIE_TARGET, "protein": DEFAULT_PROTEIN_TARGET}
+    if not profile:
+        return {"calories": DEFAULT_CALORIE_TARGET, "protein": DEFAULT_PROTEIN_TARGET}
+    w = profile.get("weight")
+    if w is not None:
+        try:
+            wf = float(w)
+            if wf > 0:
+                return calculate_targets(
+                    wf,
+                    profile.get("body_fat_percentage"),
+                    profile.get("bmr"),
+                )
+        except (TypeError, ValueError):
+            pass
+    cal = profile.get("daily_calorie_target")
+    pro = profile.get("daily_protein_target")
+    return {
+        "calories": float(cal) if cal is not None else DEFAULT_CALORIE_TARGET,
+        "protein": float(pro) if pro is not None else DEFAULT_PROTEIN_TARGET,
+    }
 
 
 def get_gap_filler(remaining_protein: float) -> str:
@@ -905,7 +923,8 @@ def calculate_targets(weight, body_fat, bmr) -> dict:
         pro = (helms_lo + helms_hi) / 2.0
     else:
         pro = min(morton_cap, max(helms_lo, 2.05 * lbm))
-    pro = int(max(120, min(280, round(pro))))
+    # 文獻實務上多落在約 210–250 g（高 LBM 減脂）；上緣與 Morton 1.62 g/kg 對齊
+    pro = int(max(120, min(250, round(pro))))
 
     return {"calories": int(round(cal)), "protein": pro}
 
@@ -1195,6 +1214,11 @@ async def handle_today_summary(user_id: str) -> str:
 
     is_cheat = db.is_cheat_day(user_id, today_str)
     cal_target = targets["calories"] * 1.3 if is_cheat else targets["calories"]
+    remaining_cal = cal_target - totals["calories"]
+    if remaining_cal >= 0:
+        remaining_cal_line = f"剩餘熱量：約 {remaining_cal:.0f} kcal"
+    else:
+        remaining_cal_line = f"熱量狀態：已超過今日目標約 {-remaining_cal:.0f} kcal"
 
     lines = [
         f"今日飲食總結 ({today_str})",
@@ -1202,6 +1226,7 @@ async def handle_today_summary(user_id: str) -> str:
         "=" * 24,
         "",
         f"總熱量：{totals['calories']:.0f}／{cal_target:.0f} kcal",
+        remaining_cal_line,
         f"總蛋白質：{totals['protein']:.0f}／{targets['protein']:.0f} g",
         f"{bar}",
         "",
