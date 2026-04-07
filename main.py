@@ -104,6 +104,13 @@ def clear_state(user_id: str):
     _user_contexts.pop(user_id, None)
 
 
+def leave_photo_wait_if_any(user_id: str) -> None:
+    """執行其他功能時離開「等待傳照」狀態，避免下一張照片被誤判流程。"""
+    s = get_state(user_id)
+    if s in (UserState.WAITING_PURCHASE_PHOTO, UserState.WAITING_INBODY_PHOTO):
+        clear_state(user_id)
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # OpenAI Vision 呼叫
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -358,7 +365,7 @@ async def get_line_image_base64(message_id: str) -> str:
 # 提示詞定義
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-PROMPT_MEAL_ANALYSIS = """你是專業的營養師，專門為減脂客戶提供飲食分析。
+PROMPT_MEAL_ANALYSIS = """你是專業、細心、有執照的極度資深營養師博士，嚴厲但也溫柔，專門為減脂客戶提供飲食分析。
 
 核心原則：熱量寧可高估，不可低估（蛋白質維持合理、不偏高一併高估）。
 - 若你判斷熱量範圍約 300～450 kcal，回報的單一數字應接近上限（例如 420～450），而非中位數
@@ -1293,7 +1300,7 @@ def _next_meal_reminder_fire_utc(now_utc: datetime, tz: ZoneInfo) -> tuple[datet
 
 
 async def execute_meal_reminder_push(slot: str) -> dict:
-    """12:30 中午／20:00 晚上：該時點前若當地當日尚無任何 LINE 訊息則推播一句。"""
+    """12:30 中午／20:30 晚上：該時點前若當地當日尚無任何 LINE 訊息則推播一句。"""
     tzname = (os.getenv("BOT_TIMEZONE") or "Asia/Taipei").strip()
     tz = ZoneInfo(tzname)
     now_local = datetime.now(timezone.utc).astimezone(tz)
@@ -1307,7 +1314,7 @@ async def execute_meal_reminder_push(slot: str) -> dict:
         text = "中午吃什麼～"
     else:
         start_iso, end_iso = _utc_range_local_midnight_to(
-            local_date, time(20, 0), tz
+            local_date, time(20, 30), tz
         )
         text = "晚餐吃什麼～"
 
@@ -1486,7 +1493,11 @@ async def webhook(request: Request):
                 continue
 
             user_id = event.source.user_id
-            db.log_line_message(user_id, datetime.now(timezone.utc).isoformat())
+            try:
+                db.log_line_message(user_id, datetime.now(timezone.utc).isoformat())
+            except Exception as e:
+                logger.warning("log_line_message 失敗（略過）: %s", e)
+
             reply_token = event.reply_token
             state = get_state(user_id)
 
@@ -1506,12 +1517,22 @@ async def webhook(request: Request):
             if reply_text:
                 reply_text = truncate_line_text(reply_text)
 
-                await line_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=reply_token,
-                        messages=[TextMessage(text=reply_text)],
+                try:
+                    await line_api.reply_message(
+                        ReplyMessageRequest(
+                            reply_token=reply_token,
+                            messages=[TextMessage(text=reply_text)],
+                        )
                     )
-                )
+                except Exception as e:
+                    logger.warning(
+                        "reply_message 失敗（常見於 Reply Token 過期或主機冷啟動過慢）: %s，改以 push 傳送",
+                        e,
+                    )
+                    try:
+                        await push_line_text(user_id, reply_text)
+                    except Exception as e2:
+                        logger.error("push 備援亦失敗: %s", e2, exc_info=True)
 
     return JSONResponse(content={"status": "ok"})
 
@@ -1523,7 +1544,7 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
 
     # ── 文字訊息 ──
     if isinstance(event.message, TextMessageContent):
-        text = event.message.text.strip()
+        text = event.message.text.replace("\u3000", " ").strip()
 
         # 狀態內的文字回應
         if state == UserState.PURCHASE_REVIEWED:
@@ -1544,40 +1565,35 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
                 clear_state(user_id)
                 return "查詢已取消。"
 
-        if state == UserState.WAITING_PURCHASE_PHOTO:
-            if text in ("取消", "結束"):
-                clear_state(user_id)
-                return "購買查詢已取消。"
-            return "請傳送食物或商品包裝的照片。\n或輸入「取消」結束查詢。"
-
-        if state == UserState.WAITING_INBODY_PHOTO:
-            if text in ("取消", "結束"):
-                clear_state(user_id)
-                return "InBody 上傳已取消。"
-            return "請傳送 InBody 報告的照片。\n或輸入「取消」結束。"
-
-        # ── 指令路由 ──
+        # ── 一般指令（優先於「等待傳照」提示，才能隨時切換購買查詢／InBody 等）──
         if text in ("說明", "幫助", "help", "Help", "HELP"):
+            leave_photo_wait_if_any(user_id)
             return HELP_TEXT
 
         if text in ("今日", "今日總計", "今日總結", "總計", "今天"):
+            leave_photo_wait_if_any(user_id)
             return await handle_today_summary(user_id)
 
         if text == "清除今日":
+            leave_photo_wait_if_any(user_id)
             today_str = date.today().isoformat()
             count = db.clear_today(user_id, today_str)
             return f"已清除今日 {count} 筆紀錄。"
 
         if text.startswith("設定蛋白飲"):
+            leave_photo_wait_if_any(user_id)
             return handle_set_quick_item(user_id, text)
 
         if text in ("加蛋白飲", "蛋白飲", "+蛋白飲", "+蛋白", "＋蛋白飲", "＋蛋白"):
+            leave_photo_wait_if_any(user_id)
             return await handle_quick_protein(user_id, "蛋白飲")
 
         if text in ("加雞蛋", "+雞蛋", "＋雞蛋"):
+            leave_photo_wait_if_any(user_id)
             return await handle_quick_protein(user_id, "雞蛋")
 
         if text in ("加雞胸肉", "+雞胸肉", "＋雞胸肉"):
+            leave_photo_wait_if_any(user_id)
             return await handle_quick_protein(user_id, "雞胸肉")
 
         if text in ("購買查詢", "食物查詢", "查詢", "買之前"):
@@ -1591,6 +1607,7 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
             )
 
         if text in ("本週積分", "積分", "積分卡", "本週", "週報"):
+            leave_photo_wait_if_any(user_id)
             return await handle_weekly_score(user_id)
 
         if text in ("上傳InBody", "InBody", "inbody", "INBODY"):
@@ -1604,9 +1621,11 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
             )
 
         if text in ("欺騙日", "cheat day", "Cheat Day"):
+            leave_photo_wait_if_any(user_id)
             return await handle_cheat_day(user_id)
 
         if text == "強制欺騙日":
+            leave_photo_wait_if_any(user_id)
             today_str = date.today().isoformat()
             db.activate_cheat_day(user_id, today_str)
             targets = get_user_targets(user_id)
@@ -1618,9 +1637,11 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
             )
 
         if text in ("AI教練", "教練", "ai教練", "AI 教練"):
+            leave_photo_wait_if_any(user_id)
             return await handle_ai_coach(user_id)
 
         if text in ("目標", "我的目標", "查看目標"):
+            leave_photo_wait_if_any(user_id)
             targets = get_user_targets(user_id)
             profile = db.get_user_profile(user_id)
             lines = [
@@ -1638,6 +1659,18 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
                     f"  上次 InBody：{profile.get('last_inbody_date', '未上傳')}",
                 ])
             return "\n".join(lines)
+
+        if state == UserState.WAITING_PURCHASE_PHOTO:
+            if text in ("取消", "結束"):
+                clear_state(user_id)
+                return "購買查詢已取消。"
+            return "請傳送食物或商品包裝的照片。\n或輸入「取消」結束查詢。"
+
+        if state == UserState.WAITING_INBODY_PHOTO:
+            if text in ("取消", "結束"):
+                clear_state(user_id)
+                return "InBody 上傳已取消。"
+            return "請傳送 InBody 報告的照片。\n或輸入「取消」結束。"
 
         # 未知指令 → 當作食物文字描述? 或提示使用說明
         return (
