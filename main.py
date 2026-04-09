@@ -392,6 +392,23 @@ PROMPT_MEAL_ANALYSIS = """你是專業、細心、有執照的極度資深營養
   "estimation_note": "簡短說明為何給這個熱量數字，例如：已含醬汁與用油、採區間上緣估算"
 }"""
 
+PROMPT_MEAL_FROM_TEXT = """你是專業、細心、有執照的極度資深營養師博士，嚴厲但也溫柔，專門為減脂客戶提供飲食分析。
+使用者會「用中文文字」描述自己吃的內容與大概份量（沒有照片）。
+
+核心原則與拍照分析相同：熱量寧可高估，不可低估（蛋白質維持合理、不刻意飆高）。
+- 描述模糊時假設較大份量；醬料、用油、隱藏熱量一律算入
+- 外食依餐廳份量特性在合理範圍內從寬估算
+
+不要使用任何 emoji。使用繁體中文。
+
+請嚴格以下列 JSON 格式回覆，不要有其他文字：
+{
+  "calories": 數字,
+  "protein": 數字,
+  "description": "食物內容的簡要描述（可整合使用者原意並補全份量假設）",
+  "estimation_note": "簡短說明為何給這個熱量數字"
+}"""
+
 PROMPT_PURCHASE_QUERY = """你是專業的營養師與食品分析師，有長年的飲養輔助經驗、飲養分析研究、有執照。分析圖片中的食物或商品包裝，提供購買前的完整評估。
 
 評級系統使用注音符號：
@@ -689,6 +706,79 @@ async def handle_meal_photo(user_id: str, message_id: str) -> str:
 
     lines = [
         "本餐分析結果",
+        "————",
+        f"食物內容：\n{desc}",
+        "",
+        "營養數據（減脂保守估計）：",
+        f"熱量：{cal:.0f} kcal",
+        f"蛋白質：{pro:.0f} g",
+    ]
+    if note:
+        lines.append(f"說明：{note}")
+    lines.extend([
+        "",
+        "————",
+        "今日累計：",
+        f"總熱量：{totals['calories']:.0f} kcal",
+        remaining_cal_line,
+        f"總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g",
+        f"{bar}",
+        "",
+        gap,
+    ])
+    return "\n".join(lines)
+
+
+def _parse_meal_text_report(text: str) -> str | None:
+    """若為文字報餐前綴，回傳去掉前綴後的描述；否則 None。"""
+    t = text.strip()
+    for prefix in ("記一筆", "記錄", "吃"):
+        if t.startswith(prefix):
+            desc = t[len(prefix) :].strip()
+            if len(desc) >= 2:
+                return desc
+            return None
+    return None
+
+
+async def handle_meal_from_text(user_id: str, user_said: str) -> str:
+    """依文字描述估算熱量與蛋白質並入帳（與拍照版同一套保守原則）。"""
+    result = await call_openai_text(
+        PROMPT_MEAL_FROM_TEXT,
+        (
+            "使用者原文如下，請估算並回傳 JSON：\n"
+            f"{user_said.strip()}\n\n"
+            "目標為減脂，熱量採保守偏高；蛋白質正常估算。"
+        ),
+    )
+
+    if isinstance(result, OpenAIUserNotice):
+        return str(result)
+    if isinstance(result, str):
+        return f"文字分析失敗，請寫清楚一點再試。\n\n原始回應：\n{result[:200]}"
+
+    cal = float(result.get("calories", 0))
+    pro = float(result.get("protein", 0))
+    desc = result.get("description", "無法辨識")
+    note = (result.get("estimation_note") or "").strip()
+
+    today_str = date.today().isoformat()
+    db.add_meal(user_id, cal, pro, f"[文字紀錄] {desc}", today_str)
+
+    totals = db.get_daily_totals(user_id, today_str)
+    targets = get_user_targets(user_id)
+    remaining = targets["protein"] - totals["protein"]
+    remaining_cal = targets["calories"] - totals["calories"]
+    remaining_cal_line = (
+        f"剩餘熱量：約 {remaining_cal:.0f} kcal"
+        if remaining_cal >= 0
+        else f"熱量狀態：已超過目標約 {-remaining_cal:.0f} kcal"
+    )
+    bar = build_progress_bar(totals["protein"], targets["protein"])
+    gap = get_gap_filler(remaining)
+
+    lines = [
+        "本餐分析結果（文字紀錄）",
         "————",
         f"食物內容：\n{desc}",
         "",
@@ -1261,49 +1351,43 @@ async def handle_today_summary(user_id: str) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def execute_daily_summary_push() -> dict:
-    """推播今日有紀錄用戶的每日總結（可重複呼叫）。"""
+    """推播每日總結（可重複呼叫）：對象為近期曾互動／有紀錄者；無餐點也會收到提示。"""
     today_str = date.today().isoformat()
-    user_ids = db.get_active_users_today(today_str)
+    meal_since = (date.today() - timedelta(days=400)).isoformat()
+    user_ids = db.get_user_ids_for_daily_summary(meal_since)
     ok, fail = 0, 0
     notion = get_notion_sync()
-    configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-    async with AsyncApiClient(configuration) as api_client:
-        line_api = AsyncMessagingApi(api_client)
-        for uid in user_ids:
-            try:
-                if notion.should_sync_line_user(uid):
-                    totals = db.get_daily_totals(uid, today_str)
-                    if totals.get("meal_count", 0) > 0:
-                        targets = get_user_targets(uid)
-                        try:
-                            await asyncio.to_thread(
-                                notion.sync_daily_nutrition,
-                                today_str,
-                                {
-                                    **totals,
-                                    "carbs": 0.0,
-                                    "fat": 0.0,
-                                },
-                                float(targets["protein"]),
-                            )
-                        except Exception as ne:
-                            logger.error(
-                                "Notion 每日同步失敗（仍會推播 LINE）%s: %s",
-                                uid[:8],
-                                ne,
-                            )
-                summary = await handle_today_summary(uid)
-                await line_api.push_message(
-                    PushMessageRequest(
-                        to=uid,
-                        messages=[TextMessage(text=truncate_line_text(summary))],
-                    )
-                )
-                ok += 1
-                logger.info("已推播每日總結給 %s...", uid[:8])
-            except Exception as e:
-                fail += 1
-                logger.error("推播失敗 %s: %s", uid[:8], e)
+    logger.info("每日總結：預計推播 %s 位使用者", len(user_ids))
+    for uid in user_ids:
+        try:
+            if notion.should_sync_line_user(uid):
+                totals = db.get_daily_totals(uid, today_str)
+                if totals.get("meal_count", 0) > 0:
+                    targets = get_user_targets(uid)
+                    try:
+                        await asyncio.to_thread(
+                            notion.sync_daily_nutrition,
+                            today_str,
+                            {
+                                **totals,
+                                "carbs": 0.0,
+                                "fat": 0.0,
+                            },
+                            float(targets["protein"]),
+                        )
+                    except Exception as ne:
+                        logger.error(
+                            "Notion 每日同步失敗（仍會推播 LINE）%s: %s",
+                            uid[:8],
+                            ne,
+                        )
+            summary = await handle_today_summary(uid)
+            await push_line_text_with_retry(uid, summary)
+            ok += 1
+            logger.info("已推播每日總結給 %s...", uid[:8])
+        except Exception as e:
+            fail += 1
+            logger.error("推播失敗 %s: %s", uid[:8], e)
     return {"date": today_str, "users": len(user_ids), "pushed_ok": ok, "pushed_fail": fail}
 
 
@@ -1319,12 +1403,24 @@ def _utc_range_local_midnight_to(
     )
 
 
+def _utc_range_local_window(
+    local_day: date, start_local: time, end_local: time, tz: ZoneInfo
+) -> tuple[str, str]:
+    """當地同日 start_local（含）至 end_local（不含）轉成 UTC ISO 區間 [start, end)。"""
+    a = datetime.combine(local_day, start_local, tzinfo=tz)
+    b = datetime.combine(local_day, end_local, tzinfo=tz)
+    return (
+        a.astimezone(timezone.utc).isoformat(),
+        b.astimezone(timezone.utc).isoformat(),
+    )
+
+
 def _next_meal_reminder_fire_utc(now_utc: datetime, tz: ZoneInfo) -> tuple[datetime, str]:
-    """下次觸發的 UTC 時刻與時段 noon／evening。"""
+    """下次觸發：當地 13:00 午餐提醒／20:30 晚餐提醒。"""
     now_local = now_utc.astimezone(tz)
     d = now_local.date()
-    noon_local = datetime.combine(d, time(12, 30), tzinfo=tz)
-    eve_local = datetime.combine(d, time(20, 0), tzinfo=tz)
+    noon_local = datetime.combine(d, time(13, 0), tzinfo=tz)
+    eve_local = datetime.combine(d, time(20, 30), tzinfo=tz)
     cands: list[tuple[datetime, str]] = []
     if now_local < noon_local:
         cands.append((noon_local.astimezone(timezone.utc), "noon"))
@@ -1332,13 +1428,13 @@ def _next_meal_reminder_fire_utc(now_utc: datetime, tz: ZoneInfo) -> tuple[datet
         cands.append((eve_local.astimezone(timezone.utc), "evening"))
     if not cands:
         d2 = d + timedelta(days=1)
-        n2 = datetime.combine(d2, time(12, 30), tzinfo=tz)
+        n2 = datetime.combine(d2, time(13, 0), tzinfo=tz)
         cands.append((n2.astimezone(timezone.utc), "noon"))
     return min(cands, key=lambda x: x[0])
 
 
 async def execute_meal_reminder_push(slot: str) -> dict:
-    """12:30 中午／20:30 晚上：該時點前若當地當日尚無任何 LINE 訊息則推播一句。"""
+    """13:00／20:30：若該時段內未傳圖、且無任何入帳餐點，才推提醒（文字報餐／快速加蛋白等入帳也算已吃過）。"""
     tzname = (os.getenv("BOT_TIMEZONE") or "Asia/Taipei").strip()
     tz = ZoneInfo(tzname)
     now_local = datetime.now(timezone.utc).astimezone(tz)
@@ -1346,13 +1442,13 @@ async def execute_meal_reminder_push(slot: str) -> dict:
     local_date_s = local_date.isoformat()
 
     if slot == "noon":
-        start_iso, end_iso = _utc_range_local_midnight_to(
-            local_date, time(12, 30), tz
+        start_iso, end_iso = _utc_range_local_window(
+            local_date, time(11, 0), time(13, 0), tz
         )
         text = "中午吃什麼～"
     else:
-        start_iso, end_iso = _utc_range_local_midnight_to(
-            local_date, time(20, 30), tz
+        start_iso, end_iso = _utc_range_local_window(
+            local_date, time(17, 0), time(20, 30), tz
         )
         text = "晚餐吃什麼～"
 
@@ -1364,7 +1460,12 @@ async def execute_meal_reminder_push(slot: str) -> dict:
         line_api = AsyncMessagingApi(api_client)
         for uid in user_ids:
             try:
-                if db.user_had_message_in_utc_range(uid, start_iso, end_iso):
+                if db.user_had_photo_in_utc_range(uid, start_iso, end_iso):
+                    skip += 1
+                    continue
+                if db.user_had_meal_logged_in_utc_window(
+                    uid, local_date_s, start_iso, end_iso
+                ):
                     skip += 1
                     continue
                 if db.reminder_already_sent(uid, local_date_s, slot):
@@ -1393,7 +1494,7 @@ async def execute_meal_reminder_push(slot: str) -> dict:
 
 
 async def meal_reminder_job_internal():
-    """進程內排程：依 BOT_TIMEZONE 每日 12:30、20:00 觸發。"""
+    """進程內排程：依 BOT_TIMEZONE 每日 13:00、20:30 觸發。"""
     tzname = (os.getenv("BOT_TIMEZONE") or "Asia/Taipei").strip()
     tz = ZoneInfo(tzname)
     logger.info("用餐提醒排程時區：%s", tzname)
@@ -1415,14 +1516,22 @@ async def meal_reminder_job_internal():
 
 
 async def daily_summary_job_internal():
-    """僅在 ENABLE_INTERNAL_DAILY_CRON=1 時啟用：進程內每晚 23:00 推播。"""
+    """僅在 ENABLE_INTERNAL_DAILY_CRON=1 時啟用：進程內每晚當地 22:00 推播（勿用伺服器本地時區）。"""
+    tzname = (os.getenv("BOT_TIMEZONE") or "Asia/Taipei").strip()
+    tz = ZoneInfo(tzname)
     while True:
-        now = datetime.now()
-        target = now.replace(hour=23, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        logger.info("內建排程：下次推播在 %.0f 秒後 (%s)", wait_seconds, target)
+        now_utc = datetime.now(timezone.utc)
+        now_local = now_utc.astimezone(tz)
+        target_local = datetime.combine(now_local.date(), time(22, 0), tzinfo=tz)
+        if now_local >= target_local:
+            target_local += timedelta(days=1)
+        fire_utc = target_local.astimezone(timezone.utc)
+        wait_seconds = max(1.0, (fire_utc - now_utc).total_seconds())
+        logger.info(
+            "內建每日總結：下次當地 22:00 推播在 %.0f 秒後（%s）",
+            wait_seconds,
+            target_local.isoformat(),
+        )
         await asyncio.sleep(wait_seconds)
         await execute_daily_summary_push()
         await asyncio.sleep(60)
@@ -1434,15 +1543,15 @@ async def daily_summary_job_internal():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """應用生命週期：初始化 DB；可選內建 23:00 與用餐提醒排程。"""
+    """應用生命週期：初始化 DB；可選內建當地 22:00 總結與用餐提醒排程。"""
     db.init()
     bg_tasks: list[asyncio.Task] = []
     if os.getenv("ENABLE_INTERNAL_DAILY_CRON") == "1":
         bg_tasks.append(asyncio.create_task(daily_summary_job_internal()))
-        logger.info("已啟用進程內每日 23:00 推播")
+        logger.info("已啟用進程內每日總結（BOT_TIMEZONE 22:00）")
     if os.getenv("ENABLE_INTERNAL_MEAL_REMINDERS", "1") != "0":
         bg_tasks.append(asyncio.create_task(meal_reminder_job_internal()))
-        logger.info("已啟用進程內 12:30／20:00 用餐提醒")
+        logger.info("已啟用進程內用餐提醒（13:00／20:30，BOT_TIMEZONE）")
     logger.info("Bot 啟動完成")
     yield
     for t in bg_tasks:
@@ -1495,6 +1604,16 @@ async def _analyze_image_by_state(user_id: str, message_id: str, state_at_receiv
     return await handle_meal_photo(user_id, message_id)
 
 
+def _log_image_background_task(task: asyncio.Task) -> None:
+    """create_task 預設吞掉例外；在此記錄，避免圖片分析靜默失敗。"""
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None:
+        logger.error("背景圖片分析任務失敗: %s", exc, exc_info=exc)
+
+
 async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_receive: str):
     """背景執行：下載、壓縮、Vision、寫入 DB，完成後 push 結果。"""
     timeout_sec = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "150"))
@@ -1531,7 +1650,8 @@ HELP_TEXT = (
     "減重監測 Bot 使用說明\n"
     "=" * 24 + "\n\n"
     "基本操作：\n"
-    "  拍照傳食物，將自動分析並記錄（熱量為減脂保守估計）。\n\n"
+    "  拍照傳食物，將自動分析並記錄（熱量為減脂保守估計）。\n"
+    "  文字報餐：以「記錄」「記一筆」或「吃」開頭＋描述（例：記錄 雞腿飯半個＋燙青菜）。\n\n"
     "文字指令：\n"
     "  「今日」：查看今日總結\n"
     "  「清除今日」：刪除今日所有紀錄\n"
@@ -1568,8 +1688,18 @@ async def webhook(request: Request):
                 continue
 
             user_id = event.source.user_id
+            if isinstance(event.message, ImageMessageContent):
+                msg_kind = "image"
+            elif isinstance(event.message, TextMessageContent):
+                msg_kind = "text"
+            else:
+                msg_kind = "other"
             try:
-                db.log_line_message(user_id, datetime.now(timezone.utc).isoformat())
+                db.log_line_message(
+                    user_id,
+                    datetime.now(timezone.utc).isoformat(),
+                    message_kind=msg_kind,
+                )
             except Exception as e:
                 logger.warning("log_line_message 失敗（略過）: %s", e)
 
@@ -1586,9 +1716,12 @@ async def webhook(request: Request):
                     )
                     reply_text = "已收到照片，正在分析中…"
                     snap_state = get_state(user_id)
-                    asyncio.create_task(
-                        run_image_analysis_and_push(user_id, event.message.id, snap_state)
+                    bg = asyncio.create_task(
+                        run_image_analysis_and_push(
+                            user_id, event.message.id, snap_state
+                        )
                     )
+                    bg.add_done_callback(_log_image_background_task)
                 else:
                     reply_text = await route_message(event, user_id, state)
             except Exception as e:
@@ -1753,11 +1886,17 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
                 return "InBody 上傳已取消。"
             return "請傳送 InBody 報告的照片。\n或輸入「取消」結束。"
 
+        meal_txt = _parse_meal_text_report(text)
+        if meal_txt:
+            leave_photo_wait_if_any(user_id)
+            return await handle_meal_from_text(user_id, meal_txt)
+
         # 未知指令 → 當作食物文字描述? 或提示使用說明
         return (
             f"無法辨識指令「{text[:20]}」。\n\n"
-            "拍照傳食物可自動分析記錄，\n"
-            "或輸入「說明」查看所有功能。"
+            "拍照傳食物可自動分析記錄；\n"
+            "或用「記錄 …」「吃 …」文字報餐。\n"
+            "輸入「說明」查看所有功能。"
         )
 
     return ""
