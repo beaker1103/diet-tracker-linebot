@@ -1,4 +1,4 @@
-# 台灣時間每天 23:00 觸發 Render 上的每日推播（UTC 15:00，無夏令時間）
+# 台灣時間每天 22:00 觸發 Render 上的每日推播（UTC 14:00，無夏令時間）
 # 請在 GitHub repo → Settings → Secrets and variables → Actions 設定：
 #   RENDER_CRON_URL = https://你的服務.onrender.com/cron/daily-summary
 #   CRON_SECRET     = 與 Render 環境變數 CRON_SECRET 相同的長隨機字串
@@ -7,7 +7,7 @@ name: Daily LINE summary
 
 on:
   schedule:
-    - cron: "0 15 * * *"
+    - cron: "0 14 * * *"
   workflow_dispatch:
 
 jobs:

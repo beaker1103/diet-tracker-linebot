@@ -572,6 +572,22 @@ def get_gap_filler(remaining_protein: float) -> str:
         return f"還缺 {remaining_protein:.0f}g——建議在剩餘餐次中優先選擇高蛋白食物。"
 
 
+def _safe_float(v, default: float = 0.0) -> float:
+    """容錯轉數字：可處理 950、約950、950 kcal、?。"""
+    if isinstance(v, (int, float)):
+        return float(v)
+    if v is None:
+        return default
+    s = str(v).strip().replace(",", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return default
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return default
+
+
 def _load_custom_quick_items(user_id: str) -> dict | None:
     profile = db.get_user_profile(user_id)
     if not profile:
@@ -682,8 +698,8 @@ async def handle_meal_photo(user_id: str, message_id: str) -> str:
     if isinstance(result, str):
         return f"分析失敗，請重新拍照。\n\n原始回應：\n{result[:200]}"
 
-    cal = float(result.get("calories", 0))
-    pro = float(result.get("protein", 0))
+    cal = _safe_float(result.get("calories"), 0.0)
+    pro = _safe_float(result.get("protein"), 0.0)
     desc = result.get("description", "無法辨識")
     note = (result.get("estimation_note") or "").strip()
 
@@ -757,8 +773,8 @@ async def handle_meal_from_text(user_id: str, user_said: str) -> str:
     if isinstance(result, str):
         return f"文字分析失敗，請寫清楚一點再試。\n\n原始回應：\n{result[:200]}"
 
-    cal = float(result.get("calories", 0))
-    pro = float(result.get("protein", 0))
+    cal = _safe_float(result.get("calories"), 0.0)
+    pro = _safe_float(result.get("protein"), 0.0)
     desc = result.get("description", "無法辨識")
     note = (result.get("estimation_note") or "").strip()
 
@@ -823,24 +839,34 @@ async def handle_purchase_query_photo(user_id: str, message_id: str) -> str:
         clear_state(user_id)
         return f"分析失敗，請重新拍照。\n\n原始回應：\n{result[:200]}"
 
-    # 儲存分析結果到 context，等使用者決定
-    set_state(user_id, UserState.PURCHASE_REVIEWED, context=result)
+    # 容錯正規化，避免後續「買了」寫 DB 時因欄位格式炸掉
+    cleaned = dict(result)
+    cleaned["calories"] = _safe_float(cleaned.get("calories"), 0.0)
+    cleaned["protein"] = _safe_float(cleaned.get("protein"), 0.0)
+    cleaned["carbs"] = _safe_float(cleaned.get("carbs"), 0.0)
+    cleaned["fat"] = _safe_float(cleaned.get("fat"), 0.0)
+    cleaned["sugar"] = _safe_float(cleaned.get("sugar"), 0.0)
+    if not isinstance(cleaned.get("grades"), dict):
+        cleaned["grades"] = {}
 
-    g = result.get("grades", {})
+    # 儲存分析結果到 context，等使用者決定
+    set_state(user_id, UserState.PURCHASE_REVIEWED, context=cleaned)
+
+    g = cleaned.get("grades", {})
     if not isinstance(g, dict):
         g = {}
 
     lines = [
         f"購買前分析報告",
         f"{'=' * 24}",
-        f"品項：{result.get('name', '未知')}",
+        f"品項：{cleaned.get('name', '未知')}",
         "",
         f"營養數據（估算）：",
-        f"  熱量：{result.get('calories', '?')} kcal",
-        f"  蛋白質：{result.get('protein', '?')} g",
-        f"  碳水化合物：{result.get('carbs', '?')} g",
-        f"  脂肪：{result.get('fat', '?')} g",
-        f"  糖：{result.get('sugar', '?')} g",
+        f"  熱量：{cleaned.get('calories', '?')} kcal",
+        f"  蛋白質：{cleaned.get('protein', '?')} g",
+        f"  碳水化合物：{cleaned.get('carbs', '?')} g",
+        f"  脂肪：{cleaned.get('fat', '?')} g",
+        f"  糖：{cleaned.get('sugar', '?')} g",
         "",
         f"等級評定：",
         f"  綜合評價：{g.get('overall', '?')}",
@@ -851,15 +877,15 @@ async def handle_purchase_query_photo(user_id: str, message_id: str) -> str:
         f"  碳水品質：{g.get('carb_quality', '?')}",
         "",
         f"適合時機：",
-        f"  {result.get('timing', '無特別建議')}",
+        f"  {cleaned.get('timing', '無特別建議')}",
         "",
         f"{'=' * 24}",
-        f"結論：{result.get('verdict', '')}",
+        f"結論：{cleaned.get('verdict', '')}",
         "",
         f"更健康的替代選項：",
     ]
 
-    for i, alt in enumerate(result.get("alternatives", []), 1):
+    for i, alt in enumerate(cleaned.get("alternatives", []), 1):
         lines.append(f"  {i}. {alt}")
 
     lines.extend([

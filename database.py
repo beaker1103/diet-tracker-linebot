@@ -290,6 +290,39 @@ class Database:
         finally:
             conn.close()
         self._migrate_user_profiles_quick_items()
+        self._migrate_user_message_log_kind()
+
+    def _migrate_user_message_log_kind(self):
+        """補上 user_message_log.message_kind（text／image），供用餐提醒判斷是否已傳照片。"""
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "ALTER TABLE user_message_log "
+                        "ADD COLUMN IF NOT EXISTS message_kind TEXT DEFAULT 'text'"
+                    )
+                    cur.execute(
+                        "UPDATE user_message_log SET message_kind = 'text' "
+                        "WHERE message_kind IS NULL"
+                    )
+                conn.commit()
+            else:
+                try:
+                    conn.execute(
+                        "ALTER TABLE user_message_log ADD COLUMN message_kind TEXT DEFAULT 'text'"
+                    )
+                    conn.commit()
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+                conn.execute(
+                    "UPDATE user_message_log SET message_kind = 'text' "
+                    "WHERE message_kind IS NULL"
+                )
+                conn.commit()
+        finally:
+            conn.close()
 
     def _migrate_user_profiles_quick_items(self):
         """舊資料庫補上 user_profiles.custom_quick_items。"""
@@ -395,6 +428,7 @@ class Database:
         finally:
             conn.close()
         self._migrate_user_profiles_quick_items()
+        self._migrate_user_message_log_kind()
 
     def _row_to_dict(self, row):
         if row is None:
@@ -705,6 +739,28 @@ class Database:
     # ━━━ 購買查詢 ━━━
 
     def save_purchase_decision(self, user_id: str, analysis: dict, decision: str):
+        def _num(v, default: float = 0.0) -> float:
+            if isinstance(v, (int, float)):
+                return float(v)
+            if v is None:
+                return default
+            s = str(v).strip().replace(",", "")
+            m = re.search(r"-?\d+(?:\.\d+)?", s)
+            if not m:
+                return default
+            try:
+                return float(m.group(0))
+            except ValueError:
+                return default
+
+        if not isinstance(analysis, dict):
+            analysis = {}
+        grades = analysis.get("grades")
+        if not isinstance(grades, dict):
+            grades = {}
+
+        calories = _num(analysis.get("calories"), 0.0)
+        protein = _num(analysis.get("protein"), 0.0)
         now = datetime.now().isoformat()
         sql_pq = self._adapt(
             """INSERT INTO purchase_queries
@@ -716,9 +772,9 @@ class Database:
             user_id, now,
             analysis.get("name", "未知"),
             decision,
-            analysis.get("calories"),
-            analysis.get("protein"),
-            analysis.get("grades", {}).get("overall"),
+            calories,
+            protein,
+            grades.get("overall"),
             json.dumps(analysis, ensure_ascii=False),
             now,
         )
@@ -738,8 +794,8 @@ class Database:
                             sql_m,
                             (
                                 user_id, now,
-                                analysis.get("calories", 0),
-                                analysis.get("protein", 0),
+                                calories,
+                                protein,
                                 f"[購買] {analysis.get('name', '未知')}",
                                 date.today().isoformat(),
                             ),
@@ -756,8 +812,8 @@ class Database:
                         ),
                         (
                             user_id, now,
-                            analysis.get("calories", 0),
-                            analysis.get("protein", 0),
+                            calories,
+                            protein,
                             f"[購買] {analysis.get('name', '未知')}",
                             date.today().isoformat(),
                         ),
@@ -768,19 +824,27 @@ class Database:
 
     # ━━━ 用餐提醒（LINE 訊息時間軸）━━━
 
-    def log_line_message(self, user_id: str, at_utc: str | None = None):
-        """記錄使用者曾傳入任一則訊息（供用餐提醒判斷當日是否已互動）。"""
+    def log_line_message(
+        self,
+        user_id: str,
+        at_utc: str | None = None,
+        message_kind: str = "text",
+    ):
+        """記錄使用者曾傳入訊息。message_kind: text／image（供用餐提醒判斷是否已傳照片）。"""
         ts = at_utc or datetime.now(timezone.utc).isoformat()
+        kind = (message_kind or "text").strip().lower()
+        if kind not in ("text", "image", "other"):
+            kind = "other"
         sql = self._adapt(
-            "INSERT INTO user_message_log (user_id, at_utc) VALUES (?, ?)"
+            "INSERT INTO user_message_log (user_id, at_utc, message_kind) VALUES (?, ?, ?)"
         )
         conn = self._connect()
         try:
             if self._pg:
                 with conn.cursor() as cur:
-                    cur.execute(sql, (user_id, ts))
+                    cur.execute(sql, (user_id, ts, kind))
             else:
-                conn.execute(sql, (user_id, ts))
+                conn.execute(sql, (user_id, ts, kind))
             conn.commit()
         finally:
             conn.close()
@@ -792,6 +856,50 @@ class Database:
         sql = self._adapt(
             """SELECT 1 FROM user_message_log
                WHERE user_id = ? AND at_utc >= ? AND at_utc < ?
+               LIMIT 1"""
+        )
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (user_id, start_iso, end_iso))
+                    row = cur.fetchone()
+            else:
+                row = conn.execute(sql, (user_id, start_iso, end_iso)).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def user_had_meal_logged_in_utc_window(
+        self, user_id: str, created_date: str, start_iso: str, end_iso: str
+    ) -> bool:
+        """該日已入帳的餐點中，是否有任一筆的 timestamp 落在 [start_iso, end_iso)（UTC ISO）。"""
+        sql = self._adapt(
+            """SELECT 1 FROM meals
+               WHERE user_id = ? AND created_date = ?
+               AND timestamp >= ? AND timestamp < ?
+               LIMIT 1"""
+        )
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (user_id, created_date, start_iso, end_iso))
+                    row = cur.fetchone()
+            else:
+                row = conn.execute(sql, (user_id, created_date, start_iso, end_iso)).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def user_had_photo_in_utc_range(
+        self, user_id: str, start_iso: str, end_iso: str
+    ) -> bool:
+        """該時段內是否曾傳送圖片訊息（僅 message_kind=image）。"""
+        sql = self._adapt(
+            """SELECT 1 FROM user_message_log
+               WHERE user_id = ? AND at_utc >= ? AND at_utc < ?
+               AND COALESCE(message_kind, 'text') = 'image'
                LIMIT 1"""
         )
         conn = self._connect()
@@ -833,6 +941,10 @@ class Database:
             return [self._row_to_dict(r)["user_id"] for r in rows]
         finally:
             conn.close()
+
+    def get_user_ids_for_daily_summary(self, meal_since_date: str) -> list[str]:
+        """每日總結推播對象：近期曾互動或有餐點紀錄者（與用餐提醒同一池，避免只吃到『當天有紀錄』）。"""
+        return self.get_user_ids_for_meal_reminders(meal_since_date)
 
     def reminder_already_sent(self, user_id: str, local_date: str, slot: str) -> bool:
         sql = self._adapt(
