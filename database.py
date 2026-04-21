@@ -87,6 +87,70 @@ def _supabase_pooler_aws1_fallback_conninfo(failed_conninfo: str) -> str | None:
     return alt if alt != failed_conninfo else None
 
 
+def _supabase_pooler_connect_candidates(conninfo: str) -> list[str]:
+    """
+    依序嘗試多組連線字串，提高 Render + Supabase Pooler 部署成功率。
+    - 若 DATABASE_URL 使用使用者「postgres」連 pooler，常需改為「postgres.<project_ref>」且 port 5432（Session）。
+    - aws-0 / aws-1 區域不一致時可自動換邊。
+    """
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(s: str | None) -> None:
+        if not s or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    add(conninfo)
+    try:
+        p = conninfo_to_dict(conninfo)
+    except Exception:
+        return out
+
+    host = (p.get("host") or "").lower()
+    user = (p.get("user") or "").strip()
+
+    if ".pooler.supabase.com" not in host:
+        return out
+
+    ref = (os.getenv("SUPABASE_PROJECT_REF") or "").strip().lower()
+    if not ref and user.lower().startswith("postgres.") and len(user) > len("postgres."):
+        ref = user.split(".", 1)[1].strip().lower()
+
+    # 常見誤用：用使用者 postgres 連 Session pooler → Tenant or user not found
+    if ref and user.lower() == "postgres":
+        q = dict(p)
+        q["user"] = f"postgres.{ref}"
+        q["port"] = 5432
+        q.pop("hostaddr", None)
+        try:
+            add(make_conninfo(**q))
+        except Exception as e:
+            logger.warning("無法組出 postgres.<ref> pooler 連線字串: %s", e)
+
+    if "aws-0-" in host:
+        q = dict(p)
+        q["host"] = host.replace("aws-0-", "aws-1-", 1)
+        q.pop("hostaddr", None)
+        try:
+            add(make_conninfo(**q))
+        except Exception:
+            pass
+    elif "aws-1-" in host:
+        q = dict(p)
+        q["host"] = host.replace("aws-1-", "aws-0-", 1)
+        q.pop("hostaddr", None)
+        try:
+            add(make_conninfo(**q))
+        except Exception:
+            pass
+
+    return out
+
+
 def _resolve_postgres_conninfo(uri: str) -> str:
     if not _should_force_ipv4_for_postgres():
         return uri
@@ -139,6 +203,17 @@ def _resolve_postgres_conninfo(uri: str) -> str:
         )
         return uri
 
+    # Supavisor Pooler：不可改成直連 IP（hostaddr），否則無法判斷 tenant → Tenant or user not found
+    if ".pooler.supabase.com" in host.lower():
+        logger.info(
+            "PostgreSQL 為 Supabase Pooler（%s），略過 IPv4 hostaddr，保留主機名解析",
+            host,
+        )
+        try:
+            return make_conninfo(**dict(params))
+        except Exception:
+            return uri
+
     # 其他主機：僅嘗試 hostaddr
     ci = _conninfo_add_ipv4_hostaddr(params)
     if ci:
@@ -166,27 +241,38 @@ class Database:
             from psycopg.rows import dict_row
 
             timeout = int(os.getenv("DATABASE_CONNECT_TIMEOUT", "15"))
-            conninfo = _resolve_postgres_conninfo(self._database_url)
-            try:
-                return psycopg.connect(
-                    conninfo,
-                    row_factory=dict_row,
-                    connect_timeout=timeout,
-                )
-            except OperationalError as e:
-                err = str(e)
-                if "Tenant or user not found" in err:
-                    alt = _supabase_pooler_aws1_fallback_conninfo(conninfo)
-                    if alt:
-                        logger.warning(
-                            "Pooler 回傳 Tenant not found，改試 aws-1 pooler 主機"
-                        )
-                        return psycopg.connect(
-                            alt,
-                            row_factory=dict_row,
-                            connect_timeout=timeout,
-                        )
-                raise
+            resolved = _resolve_postgres_conninfo(self._database_url)
+            base = _supabase_pooler_connect_candidates(resolved)
+            all_cands: list[str] = []
+            seen: set[str] = set()
+            for ci in base:
+                if ci not in seen:
+                    seen.add(ci)
+                    all_cands.append(ci)
+            for ci in list(base):
+                alt = _supabase_pooler_aws1_fallback_conninfo(ci)
+                if alt and alt not in seen:
+                    seen.add(alt)
+                    all_cands.append(alt)
+                    for extra in _supabase_pooler_connect_candidates(alt):
+                        if extra not in seen:
+                            seen.add(extra)
+                            all_cands.append(extra)
+
+            last_exc: OperationalError | None = None
+            for ci in all_cands:
+                try:
+                    return psycopg.connect(
+                        ci,
+                        row_factory=dict_row,
+                        connect_timeout=timeout,
+                    )
+                except OperationalError as e:
+                    last_exc = e
+                    logger.warning("PostgreSQL 連線失敗，嘗試下一組參數: %s", e)
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("PostgreSQL 連線：無可用候選")
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
