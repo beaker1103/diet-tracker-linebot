@@ -59,6 +59,20 @@ jobs:
             -o "$tmp" -w "%{http_code}")
           echo "HTTP $code"
           cat "$tmp"
+          # 若 RENDER_CRON_URL 指到舊路徑導致 404，且有 BASE_URL，則自動回退重試
+          if [ "$code" = "404" ] && [ -n "$BASE_URL" ]; then
+            BASE_URL="${BASE_URL%/}"
+            URL_FALLBACK="${BASE_URL}/cron/daily-summary"
+            echo "First attempt returned 404; fallback to BASE_URL + /cron/daily-summary"
+            tmp2="$(mktemp)"
+            code=$(curl -sS -X POST "$URL_FALLBACK" \
+              -H "X-Cron-Secret: $SECRET" \
+              -H "Content-Type: application/json" \
+              --retry 4 --retry-all-errors --retry-delay 5 \
+              -o "$tmp2" -w "%{http_code}")
+            echo "Fallback HTTP $code"
+            cat "$tmp2"
+          fi
           if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
             echo "::error::daily-summary cron failed with HTTP $code"
             exit 1
