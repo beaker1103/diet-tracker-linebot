@@ -29,24 +29,26 @@ jobs:
           URL="$(echo -n "${URL:-}" | tr -d '\r\n\t ')"
           BASE_URL="$(echo -n "${BASE_URL:-}" | tr -d '\r\n\t ')"
 
-          # 優先使用完整 RENDER_CRON_URL；若未設定則由 BASE_URL 組裝
-          if [ -z "$URL" ]; then
+          # 優先使用 RENDER_CRON_URL；若缺失或格式不合法，回退到 RENDER_BASE_URL
+          valid_url=0
+          case "$URL" in
+            http://*|https://*) valid_url=1 ;;
+          esac
+          if [ "$valid_url" -ne 1 ]; then
             if [ -z "$BASE_URL" ]; then
               echo "::error::請設定 Actions secrets：RENDER_CRON_URL 或 RENDER_BASE_URL"
               exit 1
             fi
+            case "$BASE_URL" in
+              http://*|https://*) ;;
+              *)
+                echo "::error::RENDER_BASE_URL 格式錯誤（需以 http:// 或 https:// 開頭）"
+                exit 1
+                ;;
+            esac
             BASE_URL="${BASE_URL%/}"
             URL="${BASE_URL}/cron/daily-summary"
           fi
-
-          # 基本格式檢查，避免把裸 host 或錯字送進 curl
-          case "$URL" in
-            http://*|https://*) ;;
-            *)
-              echo "::error::URL 格式錯誤（需以 http:// 或 https:// 開頭）"
-              exit 1
-              ;;
-          esac
 
           echo "Trigger URL prepared."
           tmp="$(mktemp)"
