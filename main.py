@@ -1380,7 +1380,18 @@ async def execute_daily_summary_push() -> dict:
     """推播每日總結（可重複呼叫）：對象為近期曾互動／有紀錄者；無餐點也會收到提示。"""
     today_str = date.today().isoformat()
     meal_since = (date.today() - timedelta(days=400)).isoformat()
-    user_ids = db.get_user_ids_for_daily_summary(meal_since)
+    try:
+        user_ids = db.get_user_ids_for_daily_summary(meal_since)
+    except Exception as e:
+        logger.error("每日總結：讀取目標使用者失敗: %s", e, exc_info=True)
+        return {
+            "date": today_str,
+            "users": 0,
+            "pushed_ok": 0,
+            "pushed_fail": 0,
+            "ok": False,
+            "error": f"load_users_failed: {e}",
+        }
     ok, fail = 0, 0
     notion = get_notion_sync()
     logger.info("每日總結：預計推播 %s 位使用者", len(user_ids))
@@ -1414,7 +1425,13 @@ async def execute_daily_summary_push() -> dict:
         except Exception as e:
             fail += 1
             logger.error("推播失敗 %s: %s", uid[:8], e)
-    return {"date": today_str, "users": len(user_ids), "pushed_ok": ok, "pushed_fail": fail}
+    return {
+        "date": today_str,
+        "users": len(user_ids),
+        "pushed_ok": ok,
+        "pushed_fail": fail,
+        "ok": True,
+    }
 
 
 def _utc_range_local_midnight_to(
@@ -1943,15 +1960,18 @@ async def ping_head():
 @app.post("/cron/daily-summary")
 async def cron_daily_summary(request: Request):
     """給 GitHub Actions 定時 POST；標頭 X-Cron-Secret 須與環境變數 CRON_SECRET 相同。"""
-    secret = os.getenv("CRON_SECRET", "")
-    if not secret:
-        raise HTTPException(status_code=503, detail="CRON_SECRET 未設定")
-    got = request.headers.get("X-Cron-Secret", "")
-    ga, gb = got.encode("utf-8"), secret.encode("utf-8")
-    if len(ga) != len(gb) or not hmac.compare_digest(ga, gb):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    result = await execute_daily_summary_push()
-    return JSONResponse(content=result)
+    _verify_cron_secret_or_401(request)
+    try:
+        result = await execute_daily_summary_push()
+        return JSONResponse(content=result)
+    except Exception as e:
+        logger.error("cron daily-summary 執行失敗: %s", e, exc_info=True)
+        return JSONResponse(
+            content={
+                "ok": False,
+                "error": f"cron_daily_summary_failed: {e}",
+            }
+        )
 
 
 def _verify_cron_secret_or_401(request: Request):

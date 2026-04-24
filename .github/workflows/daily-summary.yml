@@ -23,6 +23,16 @@ jobs:
             echo "::error::請設定 Actions secrets：RENDER_CRON_URL、CRON_SECRET"
             exit 1
           fi
-          curl -sS -f -X POST "$URL" \
+          echo "Trigger URL: $URL"
+          tmp="$(mktemp)"
+          code=$(curl -sS -X POST "$URL" \
             -H "X-Cron-Secret: $SECRET" \
-            -H "Content-Type: application/json"
+            -H "Content-Type: application/json" \
+            --retry 4 --retry-all-errors --retry-delay 5 \
+            -o "$tmp" -w "%{http_code}")
+          echo "HTTP $code"
+          cat "$tmp"
+          if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "::error::daily-summary cron failed with HTTP $code"
+            exit 1
+          fi
