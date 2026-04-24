@@ -1514,10 +1514,15 @@ async def execute_meal_reminder_push(slot: str) -> dict:
                 if db.reminder_already_sent(uid, local_date_s, slot):
                     skip += 1
                     continue
+                text_to_send = text
+                if slot == "evening":
+                    totals_today = db.get_daily_totals(uid, local_date_s)
+                    if totals_today.get("meal_count", 0) == 0:
+                        text_to_send = "今天還沒有任何飲食紀錄。\n拍一張食物照片開始記錄吧。"
                 await line_api.push_message(
                     PushMessageRequest(
                         to=uid,
-                        messages=[TextMessage(text=text)],
+                        messages=[TextMessage(text=text_to_send)],
                     )
                 )
                 db.mark_reminder_sent(uid, local_date_s, slot)
