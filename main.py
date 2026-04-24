@@ -1954,6 +1954,53 @@ async def cron_daily_summary(request: Request):
     return JSONResponse(content=result)
 
 
+def _verify_cron_secret_or_401(request: Request):
+    """驗證 cron 共享密鑰。"""
+    secret = os.getenv("CRON_SECRET", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="CRON_SECRET 未設定")
+    got = request.headers.get("X-Cron-Secret", "")
+    ga, gb = got.encode("utf-8"), secret.encode("utf-8")
+    if len(ga) != len(gb) or not hmac.compare_digest(ga, gb):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+@app.post("/cron/meal-reminder")
+async def cron_meal_reminder(request: Request):
+    """
+    給外部排程觸發用餐提醒：
+    - /cron/meal-reminder?slot=noon
+    - /cron/meal-reminder?slot=evening
+    - 未給 slot 時同次執行兩個時段
+    """
+    _verify_cron_secret_or_401(request)
+    slot = (request.query_params.get("slot") or "").strip().lower()
+    if slot in ("noon", "evening"):
+        result = await execute_meal_reminder_push(slot)
+        return JSONResponse(content=result)
+    noon = await execute_meal_reminder_push("noon")
+    evening = await execute_meal_reminder_push("evening")
+    return JSONResponse(content={"noon": noon, "evening": evening})
+
+
+@app.post("/cron/db-keepalive")
+async def cron_db_keepalive(request: Request):
+    """給外部排程觸發：執行最小 DB 讀取，避免長期閒置。"""
+    _verify_cron_secret_or_401(request)
+    today_str = date.today().isoformat()
+    probe_uid = os.getenv("DB_KEEPALIVE_PROBE_USER_ID", "__keepalive__")
+    totals = db.get_daily_totals(probe_uid, today_str)
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "date": today_str,
+            "probe_user": probe_uid,
+            "db_mode": "postgres" if db._pg else "sqlite",
+            "totals_read": totals,
+        }
+    )
+
+
 @app.get("/health")
 async def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
