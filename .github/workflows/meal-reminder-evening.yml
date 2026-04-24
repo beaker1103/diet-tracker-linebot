@@ -23,6 +23,28 @@ jobs:
             echo "::error::請設定 Actions secrets：RENDER_BASE_URL、CRON_SECRET"
             exit 1
           fi
-          curl -sS -f -X POST "$BASE_URL/cron/meal-reminder?slot=evening" \
+          BASE_URL="$(echo -n "$BASE_URL" | tr -d '\r\n\t ')"
+          BASE_URL="${BASE_URL%/}"
+          BASE_URL="${BASE_URL%/cron/daily-summary}"
+          BASE_URL="${BASE_URL%/cron/meal-reminder}"
+          BASE_URL="${BASE_URL%/cron/db-keepalive}"
+          URL="${BASE_URL}/cron/meal-reminder?slot=evening"
+          case "$URL" in
+            http://*|https://*) ;;
+            *)
+              echo "::error::RENDER_BASE_URL 格式錯誤（需以 http:// 或 https:// 開頭）"
+              exit 1
+              ;;
+          esac
+          tmp="$(mktemp)"
+          code=$(curl -sS -X POST "$URL" \
             -H "X-Cron-Secret: $SECRET" \
-            -H "Content-Type: application/json"
+            -H "Content-Type: application/json" \
+            --retry 4 --retry-all-errors --retry-delay 5 \
+            -o "$tmp" -w "%{http_code}")
+          echo "HTTP $code"
+          cat "$tmp"
+          if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "::error::meal-reminder evening failed with HTTP $code"
+            exit 1
+          fi
