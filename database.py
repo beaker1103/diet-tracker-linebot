@@ -67,9 +67,10 @@ def _supabase_direct_to_session_pooler(params: dict, ref: str) -> str | None:
         return None
     custom = (os.getenv("SUPABASE_POOLER_HOST") or "").strip()
     pooler_host = custom if custom else f"aws-0-{region}.pooler.supabase.com"
+    pooler_port = int((os.getenv("SUPABASE_POOLER_PORT") or "6543").strip() or "6543")
     merged = dict(params)
     merged["host"] = pooler_host
-    merged["port"] = 5432
+    merged["port"] = pooler_port
     merged["user"] = f"postgres.{ref}"
     merged.pop("hostaddr", None)
     try:
@@ -120,16 +121,44 @@ def _supabase_pooler_connect_candidates(conninfo: str) -> list[str]:
     if not ref and user.lower().startswith("postgres.") and len(user) > len("postgres."):
         ref = user.split(".", 1)[1].strip().lower()
 
-    # 常見誤用：用使用者 postgres 連 Session pooler → Tenant or user not found
+    cur_port = int(p.get("port") or 5432)
+
+    # 常見誤用：用使用者 postgres 連 pooler，需改成 postgres.<ref>
     if ref and user.lower() == "postgres":
         q = dict(p)
         q["user"] = f"postgres.{ref}"
-        q["port"] = 5432
         q.pop("hostaddr", None)
         try:
             add(make_conninfo(**q))
         except Exception as e:
             logger.warning("無法組出 postgres.<ref> pooler 連線字串: %s", e)
+        # 補一組切換 port（5432 <-> 6543）
+        q2 = dict(q)
+        q2["port"] = 6543 if cur_port == 5432 else 5432
+        try:
+            add(make_conninfo(**q2))
+        except Exception:
+            pass
+
+    # 若已是 postgres.<ref>，也補一組切換 port（5432 <-> 6543）
+    if user.lower().startswith("postgres."):
+        q = dict(p)
+        q["port"] = 6543 if cur_port == 5432 else 5432
+        q.pop("hostaddr", None)
+        try:
+            add(make_conninfo(**q))
+        except Exception:
+            pass
+
+    # 若是 postgres 且無 ref，仍補一組切換 port，避免僅差在 pooler 類型
+    if user.lower() == "postgres" and not ref:
+        q = dict(p)
+        q["port"] = 6543 if cur_port == 5432 else 5432
+        q.pop("hostaddr", None)
+        try:
+            add(make_conninfo(**q))
+        except Exception:
+            pass
 
     if "aws-0-" in host:
         q = dict(p)
@@ -271,6 +300,12 @@ class Database:
                     last_exc = e
                     logger.warning("PostgreSQL 連線失敗，嘗試下一組參數: %s", e)
             if last_exc:
+                if "Tenant or user not found" in str(last_exc):
+                    logger.error(
+                        "Supabase Pooler 驗證失敗：請確認 DATABASE_URL 的使用者與 pooler 類型匹配。"
+                        "建議直接貼 Supabase Dashboard 的 Connection String；"
+                        "若使用者是 postgres，請加 SUPABASE_PROJECT_REF。"
+                    )
                 raise last_exc
             raise RuntimeError("PostgreSQL 連線：無可用候選")
         conn = sqlite3.connect(self.db_path)
@@ -281,9 +316,33 @@ class Database:
 
     def init(self):
         if self._pg:
-            self._init_postgres()
-        else:
-            self._init_sqlite()
+            try:
+                self._init_postgres()
+                return
+            except Exception as e:
+                err = str(e)
+                fallback_env = (os.getenv("DB_STARTUP_ALLOW_SQLITE_FALLBACK") or "").strip().lower()
+                allow_fallback = (
+                    fallback_env in ("1", "true", "yes", "on")
+                    or (
+                        fallback_env == ""
+                        and os.getenv("RENDER", "").strip().lower() in ("1", "true", "yes")
+                        and "Tenant or user not found" in err
+                    )
+                )
+                if not allow_fallback:
+                    raise
+                logger.error(
+                    "PostgreSQL 啟動失敗，降級使用 SQLite（暫時模式）: %s",
+                    err,
+                )
+                logger.error(
+                    "請修正 Render 的 DATABASE_URL / SUPABASE_PROJECT_REF / SUPABASE_POOLER_PORT；"
+                    "修好後可關閉 DB_STARTUP_ALLOW_SQLITE_FALLBACK。"
+                )
+                self._pg = False
+                self._database_url = ""
+        self._init_sqlite()
 
     def _init_sqlite(self):
         conn = self._connect()
