@@ -178,6 +178,10 @@ class OpenAIUserNotice(str):
     """標記為應直接顯示給使用者的 OpenAI 連線／帳務錯誤說明（非模型回傳文字）。"""
 
 
+class UserFacingError(Exception):
+    """可直接顯示給使用者的流程錯誤。"""
+
+
 def _openai_error_user_message(status: int, body: str) -> str | None:
     try:
         data = json.loads(body or "{}")
@@ -241,26 +245,53 @@ async def call_openai_vision(
     if response_json_object:
         payload["response_format"] = {"type": "json_object"}
 
-    timeout = httpx.Timeout(120.0, connect=30.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        if not resp.is_success:
-            logger.error(
-                "OpenAI Vision HTTP %s: %s",
-                resp.status_code,
-                (resp.text or "")[:800],
-            )
-            um = _openai_error_user_message(resp.status_code, resp.text or "")
-            if um:
-                return OpenAIUserNotice(um)
-        resp.raise_for_status()
+    timeout_sec = float(os.getenv("OPENAI_TIMEOUT_SEC", "90"))
+    max_retries = max(1, int(os.getenv("OPENAI_MAX_RETRIES", "3")))
+    timeout = httpx.Timeout(timeout_sec, connect=20.0)
+
+    resp: httpx.Response | None = None
+    for i in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+            if not resp.is_success:
+                logger.error(
+                    "OpenAI Vision HTTP %s: %s",
+                    resp.status_code,
+                    (resp.text or "")[:800],
+                )
+                um = _openai_error_user_message(resp.status_code, resp.text or "")
+                if um:
+                    return OpenAIUserNotice(um)
+                if resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500:
+                    if i < max_retries - 1:
+                        await asyncio.sleep(0.8 * (i + 1))
+                        continue
+                    raise UserFacingError("AI 服務目前忙碌或不穩定，請稍後再試一次。")
+            resp.raise_for_status()
+            break
+        except httpx.TimeoutException:
+            logger.warning("OpenAI Vision 呼叫逾時（第 %s/%s 次）", i + 1, max_retries)
+            if i < max_retries - 1:
+                await asyncio.sleep(0.8 * (i + 1))
+                continue
+            raise UserFacingError("圖片分析等待過久，請重新傳一次照片後再試。")
+        except httpx.RequestError as e:
+            logger.warning("OpenAI Vision 網路錯誤（第 %s/%s 次）: %s", i + 1, max_retries, e)
+            if i < max_retries - 1:
+                await asyncio.sleep(0.8 * (i + 1))
+                continue
+            raise UserFacingError("目前與 AI 服務連線不穩，請稍後再試。")
+
+    if resp is None:
+        raise UserFacingError("AI 服務暫時無回應，請稍後再試。")
 
     raw = _openai_extract_message_text(resp.json())
     if not raw:
@@ -289,26 +320,53 @@ async def call_openai_text(system_prompt: str, user_prompt: str) -> dict | str:
         "response_format": {"type": "json_object"},
     }
 
-    timeout = httpx.Timeout(120.0, connect=30.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        if not resp.is_success:
-            logger.error(
-                "OpenAI Text HTTP %s: %s",
-                resp.status_code,
-                (resp.text or "")[:800],
-            )
-            um = _openai_error_user_message(resp.status_code, resp.text or "")
-            if um:
-                return OpenAIUserNotice(um)
-        resp.raise_for_status()
+    timeout_sec = float(os.getenv("OPENAI_TIMEOUT_SEC", "90"))
+    max_retries = max(1, int(os.getenv("OPENAI_MAX_RETRIES", "3")))
+    timeout = httpx.Timeout(timeout_sec, connect=20.0)
+
+    resp: httpx.Response | None = None
+    for i in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+            if not resp.is_success:
+                logger.error(
+                    "OpenAI Text HTTP %s: %s",
+                    resp.status_code,
+                    (resp.text or "")[:800],
+                )
+                um = _openai_error_user_message(resp.status_code, resp.text or "")
+                if um:
+                    return OpenAIUserNotice(um)
+                if resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500:
+                    if i < max_retries - 1:
+                        await asyncio.sleep(0.8 * (i + 1))
+                        continue
+                    raise UserFacingError("AI 服務目前忙碌或不穩定，請稍後再試一次。")
+            resp.raise_for_status()
+            break
+        except httpx.TimeoutException:
+            logger.warning("OpenAI Text 呼叫逾時（第 %s/%s 次）", i + 1, max_retries)
+            if i < max_retries - 1:
+                await asyncio.sleep(0.8 * (i + 1))
+                continue
+            raise UserFacingError("目前文字分析等待過久，請稍後再試。")
+        except httpx.RequestError as e:
+            logger.warning("OpenAI Text 網路錯誤（第 %s/%s 次）: %s", i + 1, max_retries, e)
+            if i < max_retries - 1:
+                await asyncio.sleep(0.8 * (i + 1))
+                continue
+            raise UserFacingError("目前與 AI 服務連線不穩，請稍後再試。")
+
+    if resp is None:
+        raise UserFacingError("AI 服務暫時無回應，請稍後再試。")
 
     raw = _openai_extract_message_text(resp.json())
     if not raw:
@@ -326,16 +384,45 @@ async def call_openai_text(system_prompt: str, user_prompt: str) -> dict | str:
 async def download_line_image_bytes(message_id: str) -> bytes:
     """從 LINE Message Content API 下載圖片原始位元組。"""
     url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-        )
-        resp.raise_for_status()
-    return resp.content
+    timeout = httpx.Timeout(float(os.getenv("LINE_IMAGE_TIMEOUT_SEC", "20")), connect=10.0)
+    max_retries = max(1, int(os.getenv("LINE_IMAGE_MAX_RETRIES", "3")))
+    for i in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+                )
+            if resp.status_code == 404:
+                raise UserFacingError("圖片已過期或無法取得，請重新傳送一張照片。")
+            if resp.status_code in (408, 409, 425, 429) or resp.status_code >= 500:
+                logger.warning(
+                    "LINE 圖片下載暫時失敗 HTTP %s（第 %s/%s 次）",
+                    resp.status_code,
+                    i + 1,
+                    max_retries,
+                )
+                if i < max_retries - 1:
+                    await asyncio.sleep(0.6 * (i + 1))
+                    continue
+            resp.raise_for_status()
+            return resp.content
+        except httpx.TimeoutException:
+            logger.warning("LINE 圖片下載逾時（第 %s/%s 次）", i + 1, max_retries)
+            if i < max_retries - 1:
+                await asyncio.sleep(0.6 * (i + 1))
+                continue
+            raise UserFacingError("下載圖片逾時，請重新傳送照片。")
+        except httpx.RequestError as e:
+            logger.warning("LINE 圖片下載網路錯誤（第 %s/%s 次）: %s", i + 1, max_retries, e)
+            if i < max_retries - 1:
+                await asyncio.sleep(0.6 * (i + 1))
+                continue
+            raise UserFacingError("目前無法下載圖片，請稍後再試。")
+    raise UserFacingError("目前無法取得圖片，請重新傳送照片。")
 
 
-def compress_image_bytes_to_jpeg_base64(data: bytes, max_side: int = 1600, quality: int = 85) -> str:
+def compress_image_bytes_to_jpeg_base64(data: bytes, max_side: int = 1280, quality: int = 80) -> str:
     """將圖片壓成 JPEG 再 base64，降低 Vision 請求體積。失敗時退回原始 base64。"""
     try:
         from PIL import Image
@@ -1664,7 +1751,7 @@ def _log_image_background_task(task: asyncio.Task) -> None:
 
 async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_receive: str):
     """背景執行：下載、壓縮、Vision、寫入 DB，完成後 push 結果。"""
-    timeout_sec = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "150"))
+    timeout_sec = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "120"))
     logger.info(
         "圖片分析開始 user=%s msg=%s state=%s timeout=%.0fs",
         user_id[:8],
@@ -1684,6 +1771,9 @@ async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_re
             "本次圖片分析耗時過長，已自動中止。\n"
             "請重新傳一次照片（盡量清晰、只拍重點），我會立即重跑。"
         )
+    except UserFacingError as e:
+        logger.warning("圖片分析可恢復錯誤 user=%s msg=%s err=%s", user_id[:8], message_id, e)
+        body = str(e)
     except Exception as e:
         logger.error("背景圖片分析失敗: %s", e, exc_info=True)
         body = "分析過程發生錯誤，請稍後再試或重新傳送照片。"
