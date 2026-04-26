@@ -33,7 +33,6 @@ def main() -> int:
             ("NOTION_TOKEN", token),
             ("NOTION_DAILY_DB_ID", daily_id),
             ("NOTION_INBODY_DB_ID", inbody_id),
-            ("NOTION_SYNC_USER_ID", uid),
         ]
         if not v
     ]
@@ -41,6 +40,8 @@ def main() -> int:
         print("缺少環境變數：", ", ".join(missing))
         print("請在專案根目錄的 .env 設定後再執行。")
         return 2
+    if not uid:
+        print("警告：未設定 NOTION_SYNC_USER_ID，程式將允許所有使用者同步 Notion。")
 
     from notion_client import Client
 
@@ -86,7 +87,8 @@ def main() -> int:
 
     ns = get_notion_sync()
     print(f"NotionSync.enabled = {ns.enabled}")
-    print(f"should_sync_line_user(NOTION_SYNC_USER_ID) = {ns.should_sync_line_user(uid)}")
+    probe_uid = uid or "probe-user"
+    print(f"should_sync_line_user({probe_uid}) = {ns.should_sync_line_user(probe_uid)}")
     print("通過（僅 retrieve，未寫入任何列）。")
     return 0
 

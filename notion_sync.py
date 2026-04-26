@@ -33,11 +33,22 @@ class NotionSync:
         self.daily_title_prop = (os.getenv("NOTION_DAILY_TITLE_PROP") or "日期").strip() or "日期"
         self.inbody_title_prop = (os.getenv("NOTION_INBODY_TITLE_PROP") or "檢測日期").strip() or "檢測日期"
         self._client = None
+        self._db_props: dict[str, dict[str, dict]] = {}
+        self._missing_prop_warned: set[tuple[str, str]] = set()
+        self._sync_user_missing_warned = False
         if token and self.daily_db_id and self.inbody_db_id:
             try:
                 from notion_client import Client
 
                 self._client = Client(auth=token)
+                self._db_props[self.daily_db_id] = self._load_db_properties(self.daily_db_id, "每日飲食")
+                self._db_props[self.inbody_db_id] = self._load_db_properties(self.inbody_db_id, "InBody")
+                self.daily_title_prop = self._resolve_title_prop(
+                    self.daily_db_id, self.daily_title_prop, "每日飲食"
+                )
+                self.inbody_title_prop = self._resolve_title_prop(
+                    self.inbody_db_id, self.inbody_title_prop, "InBody"
+                )
             except Exception as e:
                 logger.error("Notion Client 初始化失敗：%s", e)
         elif token or self.daily_db_id or self.inbody_db_id:
@@ -53,8 +64,10 @@ class NotionSync:
         if not self.enabled:
             return False
         if not self.sync_user_id:
-            logger.debug("未設定 NOTION_SYNC_USER_ID，略過 Notion 同步")
-            return False
+            if not self._sync_user_missing_warned:
+                logger.warning("未設定 NOTION_SYNC_USER_ID，將允許所有使用者同步 Notion")
+                self._sync_user_missing_warned = True
+            return True
         return self.sync_user_id == line_user_id
 
     def sync_daily_nutrition(
@@ -88,6 +101,12 @@ class NotionSync:
                 "餐數": {"number": meals},
                 "達標": {"checkbox": achieved},
             }
+            properties = self._filter_supported_properties(
+                self.daily_db_id, properties, required=[self.daily_title_prop], db_label="每日飲食"
+            )
+            if self.daily_title_prop not in properties:
+                logger.error("Notion 每日同步失敗：找不到可用的 Title 欄位")
+                return False
 
             existing = self._find_daily_record(date_str)
             if existing:
@@ -144,6 +163,12 @@ class NotionSync:
                 "體脂變化": {"number": round(bf_change, 1)},
                 "評估": {"select": {"name": grade}},
             }
+            properties = self._filter_supported_properties(
+                self.inbody_db_id, properties, required=[self.inbody_title_prop], db_label="InBody"
+            )
+            if self.inbody_title_prop not in properties:
+                logger.error("Notion InBody 同步失敗：找不到可用的 Title 欄位")
+                return False
 
             self._client.pages.create(
                 parent={"database_id": self.inbody_db_id},
@@ -169,6 +194,57 @@ class NotionSync:
         except Exception as e:
             logger.error("Notion 查詢每日記錄失敗：%s", e)
             return None
+
+    def _load_db_properties(self, db_id: str, db_label: str) -> dict[str, dict]:
+        try:
+            db = self._client.databases.retrieve(database_id=db_id)
+            props = db.get("properties") or {}
+            if not isinstance(props, dict):
+                return {}
+            return props
+        except Exception as e:
+            logger.error("Notion 讀取 %s 資料庫欄位失敗：%s", db_label, e)
+            return {}
+
+    def _resolve_title_prop(self, db_id: str, preferred: str, db_label: str) -> str:
+        props = self._db_props.get(db_id) or {}
+        if preferred in props:
+            return preferred
+        for name, meta in props.items():
+            if isinstance(meta, dict) and meta.get("type") == "title":
+                logger.warning(
+                    "Notion %s Title 欄位「%s」不存在，改用「%s」",
+                    db_label,
+                    preferred,
+                    name,
+                )
+                return name
+        return preferred
+
+    def _filter_supported_properties(
+        self,
+        db_id: str,
+        properties: dict[str, dict],
+        required: list[str],
+        db_label: str,
+    ) -> dict[str, dict]:
+        known = self._db_props.get(db_id) or {}
+        if not known:
+            return properties
+        result: dict[str, dict] = {}
+        for k, v in properties.items():
+            if k in known:
+                result[k] = v
+            else:
+                key = (db_id, k)
+                if key not in self._missing_prop_warned:
+                    logger.warning("Notion %s 缺少欄位「%s」，此欄位將略過同步", db_label, k)
+                    self._missing_prop_warned.add(key)
+        for req in required:
+            if req in properties and req not in result:
+                # required 欄位不存在時，讓上層流程能察覺並回報
+                continue
+        return result
 
     def _get_previous_inbody(self) -> dict | None:
         try:

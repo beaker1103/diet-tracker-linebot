@@ -66,6 +66,7 @@ DEFAULT_QUICK_ITEMS = {
     "蛋白飲": {"calories": 130, "protein": 25, "description": "乳清蛋白飲 一份"},
     "雞蛋": {"calories": 75, "protein": 6, "description": "水煮蛋 一顆"},
     "雞胸肉": {"calories": 165, "protein": 31, "description": "雞胸肉 100g"},
+    "碳水": {"calories": 130, "protein": 2, "description": "地瓜 一份（約 150g）"},
 }
 
 
@@ -1795,6 +1796,8 @@ HELP_TEXT = (
     "  「清除今日」：刪除今日所有紀錄\n"
     "  「本週積分」「週報」「積分卡」等：本週飲食成績\n"
     "  「設定蛋白飲 熱量 蛋白質」：自訂快速記錄數值（例：設定蛋白飲 130 25）\n"
+    "  「Notion狀態」：檢查目前是否會同步到 Notion\n"
+    "  「我的ID」：顯示你的 LINE userId（可用於比對 NOTION_SYNC_USER_ID）\n"
     "  「說明」：顯示此說明\n\n"
     "圖文選單：\n"
     "  「食物查詢」或「購買查詢」：買前先查熱量等級\n"
@@ -1804,7 +1807,8 @@ HELP_TEXT = (
     "快速記錄（不耗 token）：\n"
     "  「加蛋白飲」「蛋白飲」「＋蛋白」\n"
     "  「加雞蛋」「＋雞蛋」\n"
-    "  「加雞胸肉」「＋雞胸肉」"
+    "  「加雞胸肉」「＋雞胸肉」\n"
+    "  「加碳水」「加地瓜」「＋碳水」"
 )
 
 
@@ -1926,6 +1930,25 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
             leave_photo_wait_if_any(user_id)
             return await handle_today_summary(user_id)
 
+        if text in ("我的ID", "我的id", "my id", "My ID", "userid", "user id"):
+            leave_photo_wait_if_any(user_id)
+            return f"你的 LINE userId：\n{user_id}"
+
+        if text in ("Notion狀態", "notion狀態", "Notion 狀態", "notion status", "Notion status"):
+            leave_photo_wait_if_any(user_id)
+            notion = get_notion_sync()
+            sync_ok = notion.should_sync_line_user(user_id)
+            uid_set = "已設定" if notion.sync_user_id else "未設定"
+            uid_match = "符合" if sync_ok else "不符合"
+            return (
+                "Notion 同步檢查\n"
+                "--------------------\n"
+                f"Notion 啟用：{'是' if notion.enabled else '否'}\n"
+                f"NOTION_SYNC_USER_ID：{uid_set}\n"
+                f"目前 userId 是否可同步：{uid_match}\n\n"
+                "若顯示不符合，請先傳「我的ID」，並把該值填入 Render 的 NOTION_SYNC_USER_ID。"
+            )
+
         if text == "清除今日":
             leave_photo_wait_if_any(user_id)
             today_str = date.today().isoformat()
@@ -1947,6 +1970,10 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
         if text in ("加雞胸肉", "+雞胸肉", "＋雞胸肉"):
             leave_photo_wait_if_any(user_id)
             return await handle_quick_protein(user_id, "雞胸肉")
+
+        if text in ("加碳水", "碳水", "+碳水", "＋碳水", "加地瓜", "+地瓜", "＋地瓜"):
+            leave_photo_wait_if_any(user_id)
+            return await handle_quick_protein(user_id, "碳水")
 
         if text in ("購買查詢", "食物查詢", "查詢", "買之前"):
             set_state(user_id, UserState.WAITING_PURCHASE_PHOTO)
