@@ -2208,12 +2208,24 @@ async def cron_meal_reminder(request: Request):
     """
     _verify_cron_secret_or_401(request)
     slot = (request.query_params.get("slot") or "").strip().lower()
-    if slot in ("noon", "evening"):
-        result = await execute_meal_reminder_push(slot)
-        return JSONResponse(content=result)
-    noon = await execute_meal_reminder_push("noon")
-    evening = await execute_meal_reminder_push("evening")
-    return JSONResponse(content={"noon": noon, "evening": evening})
+    try:
+        if slot in ("noon", "evening"):
+            result = await execute_meal_reminder_push(slot)
+            return JSONResponse(content={"ok": True, "slot": slot, "result": result})
+        noon = await execute_meal_reminder_push("noon")
+        evening = await execute_meal_reminder_push("evening")
+        return JSONResponse(
+            content={"ok": True, "slot": "both", "noon": noon, "evening": evening}
+        )
+    except Exception as e:
+        logger.error("cron meal-reminder 執行失敗: %s", e, exc_info=True)
+        return JSONResponse(
+            content={
+                "ok": False,
+                "error": f"cron_meal_reminder_failed: {e}",
+                "slot": slot or "both",
+            }
+        )
 
 
 @app.post("/cron/db-keepalive")
