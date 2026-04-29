@@ -84,6 +84,8 @@ class UserState:
 # 記憶體內狀態 (生產環境可改用 Redis)
 _user_states: dict[str, str] = {}
 _user_contexts: dict[str, dict] = {}
+_pending_notes: dict[str, dict] = {}
+_pending_notes_lock = asyncio.Lock()
 
 
 def set_state(user_id: str, state: str, context: dict | None = None):
@@ -110,6 +112,70 @@ def leave_photo_wait_if_any(user_id: str) -> None:
     s = get_state(user_id)
     if s in (UserState.WAITING_PURCHASE_PHOTO, UserState.WAITING_INBODY_PHOTO):
         clear_state(user_id)
+
+
+def _extract_note_text(text: str) -> str | None:
+    """解析「備註 xxx」/「備註: xxx」格式，回傳備註內容。"""
+    t = text.strip()
+    prefixes = ("備註", "备注", "註記", "注記")
+    for p in prefixes:
+        if t.startswith(p):
+            body = t[len(p):].lstrip("：: ").strip()
+            return body or None
+    return None
+
+
+async def create_pending_note_window(user_id: str, message_id: str, window_sec: float) -> None:
+    """建立此圖片的備註等待視窗。"""
+    expire_at = datetime.now(timezone.utc) + timedelta(seconds=window_sec)
+    async with _pending_notes_lock:
+        _pending_notes[user_id] = {
+            "message_id": message_id,
+            "expire_at": expire_at,
+            "note": "",
+            "event": asyncio.Event(),
+        }
+
+
+async def add_pending_note_if_open(user_id: str, note: str) -> tuple[bool, str]:
+    """若仍在等待視窗內，將備註綁到最近一張圖片。"""
+    now = datetime.now(timezone.utc)
+    async with _pending_notes_lock:
+        item = _pending_notes.get(user_id)
+        if not item:
+            return False, "目前沒有可附加備註的待分析照片。請先上傳照片。"
+        if now > item["expire_at"]:
+            _pending_notes.pop(user_id, None)
+            return False, "這張照片的備註視窗已超過 5 秒，請重新上傳照片後再補備註。"
+        item["note"] = note
+        ev = item.get("event")
+        if isinstance(ev, asyncio.Event):
+            ev.set()
+    return True, f"已附加備註：{note}"
+
+
+async def wait_and_take_pending_note(user_id: str, message_id: str, window_sec: float) -> str:
+    """等待最多 window_sec 秒接收備註，並回傳備註內容。"""
+    async with _pending_notes_lock:
+        item = _pending_notes.get(user_id)
+        if not item or item.get("message_id") != message_id:
+            return ""
+        expire_at = item["expire_at"]
+        ev = item.get("event")
+    remaining = max(0.0, (expire_at - datetime.now(timezone.utc)).total_seconds())
+    wait_for = min(window_sec, remaining)
+    if wait_for > 0 and isinstance(ev, asyncio.Event):
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=wait_for)
+        except asyncio.TimeoutError:
+            pass
+    async with _pending_notes_lock:
+        latest = _pending_notes.get(user_id)
+        if not latest or latest.get("message_id") != message_id:
+            return ""
+        note = str(latest.get("note") or "").strip()
+        _pending_notes.pop(user_id, None)
+        return note
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -465,7 +531,7 @@ PROMPT_MEAL_ANALYSIS = """你是專業、細心、有執照的極度資深營養
 估算步驟：
 1. 先判斷食物種類與份量
 2. 估算合理熱量區間（最低～最高）
-3. 回報的 calories 取該區間約 75～85 百分位（偏上），不要取中位
+3. 回報的 calories 取該區間約 85～95 百分位（偏上），不要取中位
 4. 蛋白質以正常專業方式估算即可，不需刻意偏高
 
 畫面若有手部或背景，僅為持握食物，請忽略；有包裝營養標示時，熱量仍以減脂保守原則為準（標示為參考，可因實際食用量略調高）。
@@ -771,13 +837,19 @@ def handle_set_quick_item(user_id: str, text: str) -> str:
     )
 
 
-async def handle_meal_photo(user_id: str, message_id: str) -> str:
+async def handle_meal_photo(user_id: str, message_id: str, user_note: str = "") -> str:
     """處理食物照片：分析＋記錄＋回傳摘要。"""
     image_b64 = await get_line_image_base64(message_id)
+    note_prompt = ""
+    if user_note:
+        note_prompt = f"\n\n使用者補充備註（高優先參考）：\n{user_note[:300]}"
 
     result = await call_openai_vision(
         system_prompt=PROMPT_MEAL_ANALYSIS,
-        user_prompt="請分析這份餐點。目標為減脂，熱量請依提示採保守偏高估算；蛋白質正常估算。",
+        user_prompt=(
+            "請分析這份餐點。目標為減脂，熱量請依提示採保守偏高估算；蛋白質正常估算。"
+            f"{note_prompt}"
+        ),
         image_base64=image_b64,
     )
 
@@ -1732,12 +1804,17 @@ async def push_line_text_with_retry(user_id: str, text: str, attempts: int = 3):
         raise last_err
 
 
-async def _analyze_image_by_state(user_id: str, message_id: str, state_at_receive: str) -> str:
+async def _analyze_image_by_state(
+    user_id: str,
+    message_id: str,
+    state_at_receive: str,
+    user_note: str = "",
+) -> str:
     if state_at_receive == UserState.WAITING_PURCHASE_PHOTO:
         return await handle_purchase_query_photo(user_id, message_id)
     if state_at_receive == UserState.WAITING_INBODY_PHOTO:
         return await handle_inbody_photo(user_id, message_id)
-    return await handle_meal_photo(user_id, message_id)
+    return await handle_meal_photo(user_id, message_id, user_note=user_note)
 
 
 def _log_image_background_task(task: asyncio.Task) -> None:
@@ -1753,6 +1830,7 @@ def _log_image_background_task(task: asyncio.Task) -> None:
 async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_receive: str):
     """背景執行：下載、壓縮、Vision、寫入 DB，完成後 push 結果。"""
     timeout_sec = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "120"))
+    note_wait_sec = float(os.getenv("PHOTO_NOTE_WINDOW_SEC", "5"))
     logger.info(
         "圖片分析開始 user=%s msg=%s state=%s timeout=%.0fs",
         user_id[:8],
@@ -1761,8 +1839,13 @@ async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_re
         timeout_sec,
     )
     try:
+        user_note = ""
+        if state_at_receive not in (UserState.WAITING_PURCHASE_PHOTO, UserState.WAITING_INBODY_PHOTO):
+            user_note = await wait_and_take_pending_note(user_id, message_id, note_wait_sec)
+            if user_note:
+                logger.info("圖片分析附加使用者備註 user=%s msg=%s", user_id[:8], message_id)
         body = await asyncio.wait_for(
-            _analyze_image_by_state(user_id, message_id, state_at_receive),
+            _analyze_image_by_state(user_id, message_id, state_at_receive, user_note=user_note),
             timeout=timeout_sec,
         )
         logger.info("圖片分析完成 user=%s msg=%s", user_id[:8], message_id)
@@ -1791,6 +1874,7 @@ HELP_TEXT = (
     "基本操作：\n"
     "  拍照傳食物，將自動分析並記錄（熱量為減脂保守估計）。\n"
     "  文字報餐：以「記錄」「記一筆」或「吃」開頭＋描述（例：記錄 雞腿飯半個＋燙青菜）。\n\n"
+    "  傳完照片後 5 秒內可補「備註：...」（例：備註：這是雞胸肉不是豬排）。\n\n"
     "文字指令：\n"
     "  「今日」：查看今日總結\n"
     "  「清除今日」：刪除今日所有紀錄\n"
@@ -1858,6 +1942,8 @@ async def webhook(request: Request):
                     )
                     reply_text = "已收到照片，正在分析中…"
                     snap_state = get_state(user_id)
+                    if snap_state not in (UserState.WAITING_PURCHASE_PHOTO, UserState.WAITING_INBODY_PHOTO):
+                        await create_pending_note_window(user_id, event.message.id, window_sec=5.0)
                     bg = asyncio.create_task(
                         run_image_analysis_and_push(
                             user_id, event.message.id, snap_state
@@ -1901,6 +1987,11 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
     # ── 文字訊息 ──
     if isinstance(event.message, TextMessageContent):
         text = event.message.text.replace("\u3000", " ").strip()
+        note_text = _extract_note_text(text)
+        if note_text:
+            ok, msg = await add_pending_note_if_open(user_id, note_text)
+            if ok:
+                return msg
 
         # 狀態內的文字回應
         if state == UserState.PURCHASE_REVIEWED:
