@@ -364,6 +364,7 @@ class Database:
                     body_fat_percentage REAL,
                     muscle_mass REAL,
                     bmr INTEGER,
+                    tdee INTEGER,
                     daily_calorie_target INTEGER DEFAULT 2500,
                     daily_protein_target INTEGER DEFAULT 300,
                     last_inbody_date TEXT,
@@ -435,7 +436,28 @@ class Database:
         finally:
             conn.close()
         self._migrate_user_profiles_quick_items()
+        self._migrate_user_profiles_tdee()
         self._migrate_user_message_log_kind()
+
+    def _migrate_user_profiles_tdee(self):
+        """補上 user_profiles.tdee（InBody 建議熱量／TDEE）。"""
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS tdee INTEGER"
+                    )
+                conn.commit()
+            else:
+                try:
+                    conn.execute("ALTER TABLE user_profiles ADD COLUMN tdee INTEGER")
+                    conn.commit()
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+        finally:
+            conn.close()
 
     def _migrate_user_message_log_kind(self):
         """補上 user_message_log.message_kind（text／image），供用餐提醒判斷是否已傳照片。"""
@@ -508,6 +530,7 @@ class Database:
                 body_fat_percentage DOUBLE PRECISION,
                 muscle_mass DOUBLE PRECISION,
                 bmr INTEGER,
+                tdee INTEGER,
                 daily_calorie_target INTEGER DEFAULT 2500,
                 daily_protein_target INTEGER DEFAULT 300,
                 last_inbody_date TEXT,
@@ -573,6 +596,7 @@ class Database:
         finally:
             conn.close()
         self._migrate_user_profiles_quick_items()
+        self._migrate_user_profiles_tdee()
         self._migrate_user_message_log_kind()
 
     def _row_to_dict(self, row):
@@ -761,7 +785,7 @@ class Database:
             conn.close()
 
     def upsert_user_profile(self, user_id: str, weight=None, body_fat=None,
-                            muscle_mass=None, bmr=None,
+                            muscle_mass=None, bmr=None, tdee=None,
                             calorie_target=None, protein_target=None):
         now = datetime.now().isoformat()
         conn = self._connect()
@@ -782,6 +806,7 @@ class Database:
                     ("body_fat_percentage", body_fat),
                     ("muscle_mass", muscle_mass),
                     ("bmr", bmr),
+                    ("tdee", tdee),
                     ("daily_calorie_target", calorie_target),
                     ("daily_protein_target", protein_target),
                 ]:
@@ -805,13 +830,13 @@ class Database:
             else:
                 ins = self._adapt(
                     """INSERT INTO user_profiles
-                       (user_id, weight, body_fat_percentage, muscle_mass, bmr,
+                       (user_id, weight, body_fat_percentage, muscle_mass, bmr, tdee,
                         daily_calorie_target, daily_protein_target,
                         last_inbody_date, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
                 )
                 params = (
-                    user_id, weight, body_fat, muscle_mass, bmr,
+                    user_id, weight, body_fat, muscle_mass, bmr, tdee,
                     calorie_target or 2500, protein_target or 300,
                     date.today().isoformat(), now, now,
                 )
