@@ -1959,12 +1959,13 @@ HELP_TEXT = (
     "  「食物查詢」或「購買查詢」：買前先查熱量等級\n"
     "  「加蛋白飲」：一鍵記錄一份蛋白飲（不耗 AI）\n"
     "  「上傳InBody」：更新體組成\n"
-    "  「欺騙日」「AI教練」「今日總結」：同字面\n\n"
+    "  「欺騙日」「今日總結」：同字面；「加一份碳水」：同「加碳水」快速記錄\n"
+    "  「AI教練」：仍可打字使用\n\n"
     "快速記錄（不耗 token）：\n"
     "  「加蛋白飲」「蛋白飲」「＋蛋白」\n"
     "  「加雞蛋」「＋雞蛋」\n"
     "  「加雞胸肉」「＋雞胸肉」\n"
-    "  「加碳水」「加地瓜」「＋碳水」"
+    "  「加碳水」「加一份碳水」「加地瓜」「＋碳水」"
 )
 
 
@@ -2134,7 +2135,16 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
             leave_photo_wait_if_any(user_id)
             return await handle_quick_protein(user_id, "雞胸肉")
 
-        if text in ("加碳水", "碳水", "+碳水", "＋碳水", "加地瓜", "+地瓜", "＋地瓜"):
+        if text in (
+            "加碳水",
+            "加一份碳水",
+            "碳水",
+            "+碳水",
+            "＋碳水",
+            "加地瓜",
+            "+地瓜",
+            "＋地瓜",
+        ):
             leave_photo_wait_if_any(user_id)
             return await handle_quick_protein(user_id, "碳水")
 

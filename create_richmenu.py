@@ -40,7 +40,7 @@ def create_rich_menu():
                 # ┌───────────┬───────────┬───────────┐
                 # │  購買查詢  │ 加蛋白飲   │  InBody   │
                 # ├───────────┼───────────┼───────────┤
-                # │  欺騙日   │  AI教練   │  今日總計  │
+                # │  欺騙日   │ 加一份碳水 │  今日總計  │
                 # └───────────┴───────────┴───────────┘
 
                 # 左上: 食物查詢（與 main.py「購買查詢」流程相同）
@@ -63,10 +63,10 @@ def create_rich_menu():
                     bounds=RichMenuBounds(x=0, y=843, width=833, height=843),
                     action=MessageAction(label="欺騙日", text="欺騙日"),
                 ),
-                # 中下: AI教練
+                # 中下: 加一份碳水（與 main.py「加碳水」快速記錄相同邏輯）
                 RichMenuArea(
                     bounds=RichMenuBounds(x=834, y=843, width=833, height=843),
-                    action=MessageAction(label="AI教練", text="AI教練"),
+                    action=MessageAction(label="加一份碳水", text="加一份碳水"),
                 ),
                 # 右下: 今日總結（與 main.py「今日」相同）
                 RichMenuArea(
