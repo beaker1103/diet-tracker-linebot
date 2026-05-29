@@ -524,42 +524,49 @@ PROMPT_MEAL_ANALYSIS_CORE = """# 角色定位
 溝通風格：口吻專業、冷靜、一針見血，不使用任何 emoji，一律使用繁體中文。
 
 # 核心原則：減脂保守防禦（寧高勿低）
-為了確保客戶在減脂期的熱量赤字絕對安全，所有熱量估算必須採取「極度保守的上限防禦原則」：
-1. 熱量（Calories）計算：一旦推導出數值區間（Minimum ~ Maximum），最終輸出的單一數字必須【絕對採用該區間的 Maximum 上緣值】（或接近上緣 95% 的數值）。嚴禁取中位數、平均值或折衷值。
-2. 蛋白質（Protein）計算：不需刻意高估或低估，維持中立、精準的專業熟重比例估算即可。
-3. 份量與隱形盲點：若畫面或文字描述份量模糊，一律假設為較大份量。外食餐廳份量預設比家常料理多 25%。所有醬汁、勾芡、烹調油脂、隱藏糖分、飲料糖與加料一律從嚴算入。
+1. 熱量（Calories）：推導出區間（Minimum ~ Maximum）後，輸出【必須取 Maximum 上緣】（或 ≥ 上緣 95%）。嚴禁中位數、平均、折衷。
+2. 蛋白質（Protein）：同樣採保守上緣——各項蛋白質區間加總後取【Maximum 上緣】；寧可略高估，不可低估。嚴禁為了好看而湊成 5 或 10 的倍數（例如 25、30、35）；應依份量與食材逐項加總，可為 23、27、31、38 等非整五數字，精度至少到 1 g（必要時可到 0.1 g）。
+3. 份量與隱形熱量：份量模糊一律從大；外食 +25%；醬汁、勾芡、用油、隱藏糖從嚴計入。炒菜類在基礎熱量上再加約 20% 用油係數。
 
-# 分析步驟（請嚴格依此思考鏈進行內部推導）
+# 分析步驟（內部必須依序完成，不可跳步）
 
-## 步驟一：食物分類（What）
-- 將餐點精確拆解並歸類（如：精緻碳水、非精緻碳水、優質低脂蛋白、高油加工蛋白、蔬菜、高油烹調區）。
-- 有照片時：依顏色、質地、反光度辨識；忽略手部、無關背景，僅專注食物本體。包裝標示僅供最低下限參考，熱量仍以減脂保守原則從嚴上修。
-- 僅文字時：依使用者描述拆解；描述缺漏則依外食／家常慣例從寬補全份量假設。
+## 步驟一｜視覺描述（先描述、再推論）
+逐一列出畫面中每個容器／包裝／盤裝食物，各寫：
+- 外觀顏色、形狀、質地（勿用籠統詞如「滷味」「炒菜」代替描述）
+- 是否可見包裝文字或品牌
+- 烹調狀態：生／熟／冷藏未烹調／已烹調
+禁止在未描述前就斷定食物名稱。深色炒物可能是豆干菇類，不一定是香腸滷味；袋裝葉菜可能是生鮮而非燙青菜。
 
-## 步驟二：體積與份量（How Much）
-- 有照片時：以餐具（保鮮盒、碗、湯匙、免洗筷）或設備為比例尺，將 2D 轉為 3D 體積，推估各食材標準熟重（g）或份數。
-- 僅文字時：依使用者所述份數、碗盤大小、是否外食推估熟重；未說明則採較大份量。
+## 步驟二｜包裝文字辨識（有包裝則優先）
+若畫面有食品包裝，優先讀取並採用：
+- 品名、淨重（g）、每份或每 100g 營養標示（熱量、蛋白質）
+包裝可讀數據優先於純視覺猜測；熱量與蛋白質在包裝基礎上仍可依減脂原則對「實際食用量」從嚴上修。
 
-## 步驟三：烹調吸油率與隱形熱量修正（How Cooked）
-- 依表面油亮程度與多孔結構分級並套用加權：
-  - Level 1（無油／清蒸／舒肥）：油脂額外 +0g。
-  - Level 2（輕度嫩煎／家常炒）：油脂額外 +3g~5g。
-  - Level 3（外食大火炒／烘蛋／勾芡）：油脂額外 +8g~12g。
-  - Level 4（油炸／酥皮／多孔豆製品）：直接將食材總重之 15%~20% 併入油脂熱量計算。
+## 步驟三｜分類、份量與生熟（What + How Much）
+- 依步驟一、二推論品項與熟重（g）或份數；標註每項信心（高／中／低）。
+- 生鮮冷藏、仍在原包裝、色澤偏生（如粉白雞胸）→ 標記「未烹調／待烹調」；若無法確認使用者已食用，在 breakdown 註明「假設已烹調並計入」或列入 user_confirm_prompt。
+- 有照片時以餐具為比例尺估體積；僅文字時依描述，缺漏從大。
 
-## 步驟四：區間推導與上限加總（Output）
-- 計算該餐【合理熱量區間（最低~最高）】。
-- JSON 的 calories 必須為【Maximum 上緣】；protein 為精準中立值。
+## 步驟四｜烹調與隱形熱量（How Cooked）
+- Level 1（無油／清蒸）：+0g 油
+- Level 2（家常炒）：+3~5g 油
+- Level 3（外食大火炒／勾芡）：+8~12g 油，或熱量 +20% 用油係數
+- Level 4（油炸／酥皮）：食材總重 15%~20% 併入油脂熱量
 
-# 輸出格式規範
-請在內部完成上述四步驟後，僅回覆一段合法 JSON（勿輸出 JSON 以外文字）。
-文字欄位請用 Markdown 撰寫，並只提供「食物拆解明細（簡潔版）」：
+## 步驟五｜區間加總與輸出
+- 逐項估算熱量、蛋白質區間後加總；calories 與 protein 皆取總區間 Maximum。
+- 禁止輸出明顯湊整的 protein（整數且為 5 的倍數）除非逐項加總結果確實如此。
+
+# 輸出格式（僅 JSON，無其他文字）
 {
   "calories": 數字,
   "protein": 數字,
-  "description": "一句話餐點摘要",
-  "food_breakdown": "Markdown：食物拆解明細（簡潔版，1~3 點；分類與份量關鍵即可）",
-  "estimation_note": "可選；一句話補充關鍵假設（如外食+25%、醬汁與用油已計入）"
+  "description": "一句話餐點摘要（含生熟假設若適用）",
+  "food_breakdown": "Markdown 簡潔版：每項「名稱｜約XXg｜生/熟｜依據：包裝/視覺」",
+  "recognition_confidence": "高或中或低",
+  "uncertain_items": "不確定項目與採用的保守假設，無則空字串",
+  "user_confirm_prompt": "建議使用者確認的一句話，無則空字串",
+  "estimation_note": "熱量/蛋白採區間上緣等關鍵假設"
 }"""
 
 PROMPT_MEAL_ANALYSIS = (
@@ -567,7 +574,7 @@ PROMPT_MEAL_ANALYSIS = (
     + """
 
 # 本任務：照片餐點分析
-使用者提供食物照片。請依「視覺特徵掃描」執行步驟一、二；手部與背景一律忽略。"""
+使用者提供食物照片。必須先完成步驟一（視覺描述）與步驟二（包裝文字），再分類；忽略手部與無關背景。"""
 )
 
 PROMPT_MEAL_FROM_TEXT = (
@@ -575,7 +582,7 @@ PROMPT_MEAL_FROM_TEXT = (
     + """
 
 # 本任務：文字餐點分析
-使用者以中文文字描述餐點與大概份量（無照片）。請依文字內容執行步驟一、二；缺漏份量依外食＋25% 與較大份量原則補全。"""
+使用者以中文描述餐點（無照片）。跳過步驟一視覺與步驟二包裝，從步驟三依文字執行；缺漏份量從大、外食 +25%。"""
 )
 
 PROMPT_PURCHASE_QUERY = """你是專業的營養師與食品分析師，有長年的飲養輔助經驗、飲養分析研究、有執照。分析圖片中的食物或商品包裝，提供購買前的完整評估。
@@ -729,10 +736,20 @@ def build_progress_bar(current: float, target: float, width: int = 20) -> str:
     return f"[{bar}] {pct:.0f}%"
 
 
+def _format_meal_macro_g(value: float) -> str:
+    """蛋白質顯示：保留 1 位小數（若為整數則不顯示 .0）。"""
+    if abs(value - round(value)) < 0.05:
+        return f"{round(value):.0f}"
+    return f"{value:.1f}"
+
+
 def _meal_analysis_detail_lines(result: dict, cal: float, pro: float, desc: str) -> list[str]:
     """組裝 AI 回傳的 Markdown 分析區塊與數值摘要。"""
     note = (result.get("estimation_note") or "").strip()
     breakdown = (result.get("food_breakdown") or "").strip()
+    confidence = (result.get("recognition_confidence") or "").strip()
+    uncertain = (result.get("uncertain_items") or "").strip()
+    confirm = (result.get("user_confirm_prompt") or "").strip()
 
     lines = [
         f"食物內容：\n{desc}",
@@ -740,10 +757,17 @@ def _meal_analysis_detail_lines(result: dict, cal: float, pro: float, desc: str)
     ]
     if breakdown:
         lines.extend(["食物拆解明細（簡潔版）", breakdown, ""])
+    if confidence:
+        lines.append(f"辨識信心：{confidence}")
+    if uncertain:
+        lines.append(f"不確定項目：{uncertain}")
+    if confirm:
+        lines.append(f"建議確認：{confirm}")
     lines.extend([
-        "營養數據（減脂保守估計）：",
+        "",
+        "營養數據（減脂保守估計，熱量與蛋白質皆採區間上緣）：",
         f"熱量：{cal:.0f} kcal",
-        f"蛋白質：{pro:.0f} g",
+        f"蛋白質：{_format_meal_macro_g(pro)} g",
     ])
     if note:
         lines.append(f"說明：{note}")
@@ -972,12 +996,13 @@ async def handle_meal_photo(user_id: str, message_id: str, user_note: str = "") 
     result = await call_openai_vision(
         system_prompt=PROMPT_MEAL_ANALYSIS,
         user_prompt=(
-            "請分析這份餐點照片。目標為減脂：依四步驟推導，"
-            "calories 取熱量區間 Maximum，protein 精準中立估算，"
-            "並只填寫簡潔版的 food_breakdown。"
+            "請分析這份餐點照片。目標為減脂：先描述畫面再推論品項；"
+            "有包裝則優先讀標示；區分生/熟；calories 與 protein 皆取區間 Maximum，"
+            "蛋白質勿湊 5 的倍數；填寫 food_breakdown 與信心欄位。"
             f"{note_prompt}"
         ),
         image_base64=image_b64,
+        image_detail="high",
     )
 
     if isinstance(result, OpenAIUserNotice):
@@ -1042,10 +1067,10 @@ async def handle_meal_from_text(user_id: str, user_said: str) -> str:
     result = await call_openai_text(
         PROMPT_MEAL_FROM_TEXT,
         (
-            "使用者原文如下，請依四步驟推導並回傳 JSON：\n"
+            "使用者原文如下，請依步驟三～五推導並回傳 JSON：\n"
             f"{user_said.strip()}\n\n"
-            "目標為減脂：calories 取熱量區間 Maximum，protein 精準中立估算，"
-            "並只填寫簡潔版的 food_breakdown。"
+            "目標為減脂：calories 與 protein 皆取區間 Maximum；"
+            "蛋白質勿湊 5 的倍數；填寫 food_breakdown 與信心欄位。"
         ),
     )
 
