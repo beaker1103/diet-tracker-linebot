@@ -437,6 +437,7 @@ class Database:
             conn.close()
         self._migrate_user_profiles_quick_items()
         self._migrate_user_profiles_tdee()
+        self._migrate_user_profiles_onboarding()
         self._migrate_user_message_log_kind()
 
     def _migrate_user_profiles_tdee(self):
@@ -456,6 +457,49 @@ class Database:
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e).lower():
                         raise
+        finally:
+            conn.close()
+
+    def _migrate_user_profiles_onboarding(self):
+        """補上 fitness_goal、onboarding_complete；既有 InBody 使用者視為已完成 onboarding。"""
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "ALTER TABLE user_profiles "
+                        "ADD COLUMN IF NOT EXISTS fitness_goal TEXT"
+                    )
+                    cur.execute(
+                        "ALTER TABLE user_profiles "
+                        "ADD COLUMN IF NOT EXISTS onboarding_complete INTEGER DEFAULT 0"
+                    )
+                    cur.execute(
+                        "UPDATE user_profiles SET onboarding_complete = 1 "
+                        "WHERE last_inbody_date IS NOT NULL "
+                        "AND (onboarding_complete IS NULL OR onboarding_complete = 0)"
+                    )
+                conn.commit()
+            else:
+                for col, ddl in (
+                    ("fitness_goal", "ALTER TABLE user_profiles ADD COLUMN fitness_goal TEXT"),
+                    (
+                        "onboarding_complete",
+                        "ALTER TABLE user_profiles ADD COLUMN onboarding_complete INTEGER DEFAULT 0",
+                    ),
+                ):
+                    try:
+                        conn.execute(ddl)
+                        conn.commit()
+                    except sqlite3.OperationalError as e:
+                        if "duplicate column" not in str(e).lower():
+                            raise
+                conn.execute(
+                    "UPDATE user_profiles SET onboarding_complete = 1 "
+                    "WHERE last_inbody_date IS NOT NULL "
+                    "AND (onboarding_complete IS NULL OR onboarding_complete = 0)"
+                )
+                conn.commit()
         finally:
             conn.close()
 
@@ -597,6 +641,7 @@ class Database:
             conn.close()
         self._migrate_user_profiles_quick_items()
         self._migrate_user_profiles_tdee()
+        self._migrate_user_profiles_onboarding()
         self._migrate_user_message_log_kind()
 
     def _row_to_dict(self, row):
@@ -784,9 +829,53 @@ class Database:
         finally:
             conn.close()
 
+    def is_onboarded(self, user_id: str) -> bool:
+        profile = self.get_user_profile(user_id)
+        if not profile:
+            return False
+        return bool(profile.get("onboarding_complete"))
+
+    def needs_inbody(self, user_id: str) -> bool:
+        profile = self.get_user_profile(user_id)
+        return profile is None or not profile.get("last_inbody_date")
+
+    def needs_fitness_goal(self, user_id: str) -> bool:
+        profile = self.get_user_profile(user_id)
+        if not profile or not profile.get("last_inbody_date"):
+            return False
+        return not bool(profile.get("onboarding_complete"))
+
+    def complete_onboarding(
+        self,
+        user_id: str,
+        fitness_goal: str,
+        calorie_target: int,
+        protein_target: int,
+    ):
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            sql = self._adapt(
+                """UPDATE user_profiles
+                   SET fitness_goal = ?, daily_calorie_target = ?,
+                       daily_protein_target = ?, onboarding_complete = 1,
+                       updated_at = ?
+                   WHERE user_id = ?"""
+            )
+            params = (fitness_goal, calorie_target, protein_target, now, user_id)
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+            else:
+                conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
     def upsert_user_profile(self, user_id: str, weight=None, body_fat=None,
                             muscle_mass=None, bmr=None, tdee=None,
-                            calorie_target=None, protein_target=None):
+                            calorie_target=None, protein_target=None,
+                            onboarding_complete: int | None = None):
         now = datetime.now().isoformat()
         conn = self._connect()
         try:
@@ -809,6 +898,7 @@ class Database:
                     ("tdee", tdee),
                     ("daily_calorie_target", calorie_target),
                     ("daily_protein_target", protein_target),
+                    ("onboarding_complete", onboarding_complete),
                 ]:
                     if val is not None:
                         updates.append(f"{col} = ?")
@@ -832,13 +922,14 @@ class Database:
                     """INSERT INTO user_profiles
                        (user_id, weight, body_fat_percentage, muscle_mass, bmr, tdee,
                         daily_calorie_target, daily_protein_target,
-                        last_inbody_date, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                        onboarding_complete, last_inbody_date, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
                 )
+                ob = 0 if onboarding_complete is None else int(onboarding_complete)
                 params = (
                     user_id, weight, body_fat, muscle_mass, bmr, tdee,
                     calorie_target or 2500, protein_target or 300,
-                    date.today().isoformat(), now, now,
+                    ob, date.today().isoformat(), now, now,
                 )
                 if self._pg:
                     with conn.cursor() as cur:
