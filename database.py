@@ -8,7 +8,7 @@ import os
 import re
 import socket
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 import logging
 
@@ -438,6 +438,7 @@ class Database:
         self._migrate_user_profiles_quick_items()
         self._migrate_user_profiles_tdee()
         self._migrate_user_profiles_onboarding()
+        self._migrate_user_profiles_jitai()
         self._migrate_user_message_log_kind()
 
     def _migrate_user_profiles_tdee(self):
@@ -642,7 +643,32 @@ class Database:
         self._migrate_user_profiles_quick_items()
         self._migrate_user_profiles_tdee()
         self._migrate_user_profiles_onboarding()
+        self._migrate_user_profiles_jitai()
         self._migrate_user_message_log_kind()
+
+    def _migrate_user_profiles_jitai(self):
+        """補上 jitai_nudges_enabled（智能體醒，預設關閉、需手動開啟）。"""
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "ALTER TABLE user_profiles "
+                        "ADD COLUMN IF NOT EXISTS jitai_nudges_enabled INTEGER DEFAULT 0"
+                    )
+                conn.commit()
+            else:
+                try:
+                    conn.execute(
+                        "ALTER TABLE user_profiles "
+                        "ADD COLUMN jitai_nudges_enabled INTEGER DEFAULT 0"
+                    )
+                    conn.commit()
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+        finally:
+            conn.close()
 
     def _row_to_dict(self, row):
         if row is None:
@@ -844,6 +870,78 @@ class Database:
         if not profile or not profile.get("last_inbody_date"):
             return False
         return not bool(profile.get("onboarding_complete"))
+
+    def jitai_nudges_enabled(self, user_id: str) -> bool:
+        profile = self.get_user_profile(user_id)
+        if not profile:
+            return False
+        return bool(profile.get("jitai_nudges_enabled"))
+
+    def set_jitai_nudges_enabled(self, user_id: str, enabled: bool) -> None:
+        now = datetime.now().isoformat()
+        conn = self._connect()
+        try:
+            sel = self._adapt("SELECT user_id FROM user_profiles WHERE user_id = ?")
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sel, (user_id,))
+                    exists = cur.fetchone()
+                    if exists:
+                        cur.execute(
+                            self._adapt(
+                                "UPDATE user_profiles SET jitai_nudges_enabled = ?, "
+                                "updated_at = ? WHERE user_id = ?"
+                            ),
+                            (1 if enabled else 0, now, user_id),
+                        )
+                    else:
+                        cur.execute(
+                            self._adapt(
+                                """INSERT INTO user_profiles
+                                   (user_id, jitai_nudges_enabled, created_at, updated_at)
+                                   VALUES (?, ?, ?, ?)"""
+                            ),
+                            (user_id, 1 if enabled else 0, now, now),
+                        )
+            else:
+                exists = conn.execute(sel, (user_id,)).fetchone()
+                if exists:
+                    conn.execute(
+                        self._adapt(
+                            "UPDATE user_profiles SET jitai_nudges_enabled = ?, "
+                            "updated_at = ? WHERE user_id = ?"
+                        ),
+                        (1 if enabled else 0, now, user_id),
+                    )
+                else:
+                    conn.execute(
+                        self._adapt(
+                            """INSERT INTO user_profiles
+                               (user_id, jitai_nudges_enabled, created_at, updated_at)
+                               VALUES (?, ?, ?, ?)"""
+                        ),
+                        (user_id, 1 if enabled else 0, now, now),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_user_ids_with_jitai_enabled(self) -> list[str]:
+        sql = self._adapt(
+            """SELECT user_id FROM user_profiles
+               WHERE jitai_nudges_enabled = 1 AND onboarding_complete = 1"""
+        )
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                    rows = cur.fetchall()
+            else:
+                rows = conn.execute(sql).fetchall()
+            return [self._row_to_dict(r)["user_id"] for r in rows]
+        finally:
+            conn.close()
 
     def complete_onboarding(
         self,
@@ -1149,6 +1247,46 @@ class Database:
                     row = cur.fetchone()
             else:
                 row = conn.execute(sql, (user_id, created_date, start_iso, end_iso)).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def user_had_meal_in_recent_minutes(
+        self,
+        user_id: str,
+        created_date: str,
+        minutes: int,
+        end_utc_iso: str | None = None,
+    ) -> bool:
+        """今日餐點中，是否有在過去 minutes 分鐘內入帳（避免剛吃完又體醒）。"""
+        end_dt = (
+            datetime.fromisoformat(end_utc_iso.replace("Z", "+00:00"))
+            if end_utc_iso
+            else datetime.now(timezone.utc)
+        )
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        start_dt = end_dt - timedelta(minutes=max(1, minutes))
+        sql = self._adapt(
+            """SELECT 1 FROM meals
+               WHERE user_id = ? AND created_date = ?
+               AND timestamp >= ? AND timestamp < ?
+               LIMIT 1"""
+        )
+        conn = self._connect()
+        try:
+            params = (
+                user_id,
+                created_date,
+                start_dt.isoformat(),
+                end_dt.isoformat(),
+            )
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    row = cur.fetchone()
+            else:
+                row = conn.execute(sql, params).fetchone()
             return row is not None
         finally:
             conn.close()

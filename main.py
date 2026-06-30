@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 from linebot.v3 import WebhookParser
@@ -44,6 +44,7 @@ LINE_CHANNEL_SECRET = (os.getenv("LINE_CHANNEL_SECRET") or "").strip()
 LINE_CHANNEL_ACCESS_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o").strip()
+JITAI_MODEL = (os.getenv("JITAI_MODEL") or "gpt-4o-mini").strip()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -174,15 +175,163 @@ def leave_photo_wait_if_any(user_id: str) -> None:
         clear_state(user_id)
 
 
-def _extract_note_text(text: str) -> str | None:
-    """解析「備註 xxx」/「備註: xxx」格式，回傳備註內容。"""
+def _photo_note_window_sec() -> float:
+    return float(os.getenv("PHOTO_NOTE_WINDOW_SEC", "10"))
+
+
+def _extract_note_text(text: str) -> tuple[str | None, bool]:
+    """解析「備註／備注／秤重／克數 xxx」，回傳 (內容, 是否為秤重前綴)。"""
     t = text.strip()
-    prefixes = ("備註", "备注", "註記", "注記")
-    for p in prefixes:
+    scale_prefixes = ("秤重", "克數", "餐食克數", "餐時克數")
+    normal_prefixes = ("備註", "備注", "备注", "註記", "注記")
+    for p in scale_prefixes:
         if t.startswith(p):
             body = t[len(p):].lstrip("：: ").strip()
-            return body or None
-    return None
+            return (body or None), True
+    for p in normal_prefixes:
+        if t.startswith(p):
+            body = t[len(p):].lstrip("：: ").strip()
+            return (body or None), False
+    return None, False
+
+
+_SCALE_NOTE_KEYWORDS = ("秤重", "克數", "餐食克數", "餐時克數")
+_SCALE_SKIP_NAMES = frozenset({
+    "備註", "備注", "秤重", "克數", "餐食克數", "餐時克數", "約", "大概", "半份", "一份",
+    "總重量", "總重", "總共",
+})
+
+
+def _parse_total_weight_from_note(note: str) -> float | None:
+    """解析備註中的全餐一次秤重總熟重（公克）。"""
+    if not (note or "").strip():
+        return None
+    m = re.search(
+        r"總(?:重量|重|共)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:g|克|公克)?",
+        note,
+        re.I,
+    )
+    if not m:
+        return None
+    grams = float(m.group(1))
+    if grams <= 0 or grams > 5000:
+        return None
+    return grams
+
+
+def _parse_scale_weights_from_note(
+    note: str, *, force_scale: bool = False,
+) -> list[dict[str, str | float]]:
+    """從備註解析廚房秤實測克數，回傳 [{"name": "雞胸", "grams": 150.0}, ...]。"""
+    if not (note or "").strip():
+        return []
+    has_scale_hint = force_scale or any(kw in note for kw in _SCALE_NOTE_KEYWORDS)
+    has_unit_hint = bool(re.search(r"(?:\d\s*(?:g|克|公克)\b)", note, re.I))
+
+    items: list[dict[str, str | float]] = []
+    seen: set[str] = set()
+
+    def _add(name: str, grams: float) -> None:
+        name = name.strip().strip("、，,;； ")
+        if not name or name in _SCALE_SKIP_NAMES:
+            return
+        if re.match(r"^總(?:重量|重|共)", name):
+            return
+        if re.match(r"^[兩三四五六七八九十半\d]+[個片塊碗盤份杯]", name):
+            return
+        if grams <= 0 or grams > 5000:
+            return
+        key = name.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        items.append({"name": name, "grams": grams})
+
+    for m in re.finditer(
+        r"([^\d、,，;；\n\r]{1,24}?)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(g|克|公克)?",
+        note,
+        re.I,
+    ):
+        name = m.group(1)
+        unit = (m.group(3) or "").strip()
+        grams = float(m.group(2))
+        if unit or has_scale_hint or has_unit_hint:
+            _add(name, grams)
+
+    if not items and (has_scale_hint or "、" in note or "，" in note):
+        for part in re.split(r"[、,，]", note):
+            part = part.strip()
+            if not part:
+                continue
+            m = re.match(r"^(.+?)\s+(\d+(?:\.\d+)?)\s*(?:g|克|公克)?$", part, re.I)
+            if m:
+                _add(m.group(1), float(m.group(2)))
+
+    return items
+
+
+def _format_scale_weights_summary(weights: list[dict[str, str | float]]) -> str:
+    return "、".join(f'{w["name"]} {w["grams"]:.0f}g' for w in weights)
+
+
+def _format_note_ack(note: str, *, force_scale: bool = False) -> str:
+    """組裝備註附加成功的回覆文案。"""
+    weights = _parse_scale_weights_from_note(note, force_scale=force_scale)
+    total = _parse_total_weight_from_note(note)
+    lines: list[str] = []
+    if weights:
+        lines.append(f"已附加秤重備註：{_format_scale_weights_summary(weights)}")
+    if total is not None:
+        lines.append(f"總重量：{total:.0f}g")
+    if weights or total is not None:
+        lines.append("（分析將優先採用實測克數）")
+        return "\n".join(lines)
+    return f"已附加備註：{note}"
+
+
+def _build_meal_photo_note_prompt(
+    user_note: str, *, force_scale: bool = False,
+) -> tuple[str, list[dict[str, str | float]], float | None]:
+    """組裝照片分析的備註／秤重提示詞。"""
+    note = (user_note or "").strip()
+    if not note:
+        return "", [], None
+    total_weight = _parse_total_weight_from_note(note)
+    weights = _parse_scale_weights_from_note(note, force_scale=force_scale)
+    has_scale_data = bool(weights) or total_weight is not None
+    limit = 500 if has_scale_data else 300
+    clipped = note[:limit]
+    if has_scale_data:
+        blocks = [f"使用者備註原文：\n{clipped}"]
+        if weights:
+            weight_lines = "\n".join(f"- {w['name']}：{w['grams']:.0f} g" for w in weights)
+            blocks.append(f"【各品項實測熟重（公克）— 必須採用】\n{weight_lines}")
+        if total_weight is not None:
+            blocks.append(
+                f"【全餐一次秤重總熟重（公克）— 必須採用】\n"
+                f"- 總重量：{total_weight:.0f} g"
+            )
+        rules = [
+            "秤重規則：",
+            "- 以上為使用者廚房秤實測值，禁止用視覺估份量覆寫。",
+        ]
+        if weights:
+            rules.append("- 各品項克數已給定者，熱量與蛋白質必須依該熟重計算；food_breakdown 標「依據：秤重」。")
+        if total_weight is not None:
+            if weights:
+                rules.append(
+                    f"- 總重量 {total_weight:.0f}g 亦為實測值；各品項克數加總應與總重一致"
+                    "（必要時僅微調未單獨秤重者）。"
+                )
+            else:
+                rules.append(
+                    "- 使用者僅提供全餐總重：依照片辨識品項後，按盤面體積／占比分配各項熟重，"
+                    "加總須等於總重量；food_breakdown 標「依據：總重分配」。"
+                )
+        rules.append("- 照片僅用於核對品項與烹調方式。")
+        blocks.append("\n".join(rules))
+        return "\n\n" + "\n\n".join(blocks), weights, total_weight
+    return f"\n\n使用者補充備註（高優先參考）：\n{clipped}", [], None
 
 
 async def create_pending_note_window(user_id: str, message_id: str, window_sec: float) -> None:
@@ -193,11 +342,14 @@ async def create_pending_note_window(user_id: str, message_id: str, window_sec: 
             "message_id": message_id,
             "expire_at": expire_at,
             "note": "",
+            "force_scale": False,
             "event": asyncio.Event(),
         }
 
 
-async def add_pending_note_if_open(user_id: str, note: str) -> tuple[bool, str]:
+async def add_pending_note_if_open(
+    user_id: str, note: str, *, force_scale: bool = False,
+) -> tuple[bool, str]:
     """若仍在等待視窗內，將備註綁到最近一張圖片。"""
     now = datetime.now(timezone.utc)
     async with _pending_notes_lock:
@@ -206,20 +358,24 @@ async def add_pending_note_if_open(user_id: str, note: str) -> tuple[bool, str]:
             return False, "目前沒有可附加備註的待分析照片。請先上傳照片。"
         if now > item["expire_at"]:
             _pending_notes.pop(user_id, None)
-            return False, "這張照片的備註視窗已超過 5 秒，請重新上傳照片後再補備註。"
+            sec = int(_photo_note_window_sec())
+            return False, f"這張照片的備註視窗已超過 {sec} 秒，請重新上傳照片後再補備註。"
         item["note"] = note
+        item["force_scale"] = force_scale
         ev = item.get("event")
         if isinstance(ev, asyncio.Event):
             ev.set()
-    return True, f"已附加備註：{note}"
+    return True, _format_note_ack(note, force_scale=force_scale)
 
 
-async def wait_and_take_pending_note(user_id: str, message_id: str, window_sec: float) -> str:
-    """等待最多 window_sec 秒接收備註，並回傳備註內容。"""
+async def wait_and_take_pending_note(
+    user_id: str, message_id: str, window_sec: float,
+) -> tuple[str, bool]:
+    """等待最多 window_sec 秒接收備註，回傳 (備註內容, 是否為秤重前綴)。"""
     async with _pending_notes_lock:
         item = _pending_notes.get(user_id)
         if not item or item.get("message_id") != message_id:
-            return ""
+            return "", False
         expire_at = item["expire_at"]
         ev = item.get("event")
     remaining = max(0.0, (expire_at - datetime.now(timezone.utc)).total_seconds())
@@ -232,10 +388,11 @@ async def wait_and_take_pending_note(user_id: str, message_id: str, window_sec: 
     async with _pending_notes_lock:
         latest = _pending_notes.get(user_id)
         if not latest or latest.get("message_id") != message_id:
-            return ""
+            return "", False
         note = str(latest.get("note") or "").strip()
+        force_scale = bool(latest.get("force_scale"))
         _pending_notes.pop(user_id, None)
-        return note
+        return note, force_scale
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -430,6 +587,50 @@ async def call_openai_vision(
     return raw
 
 
+PROMPT_JITAI_NUDGE = """你是減脂／增肌飲食教練，撰寫「此刻可執行」的 JITAI 體醒訊息。
+
+原則：
+- 不要只播報數字；必須給 2～3 個可馬上採行的食物組合（每項一行，含約略蛋白質與熱量）
+- 優先便利、超商／外食可取得、高蛋白密度（例：希臘優格＋花生醬、酪梨＋水煮蛋、乳清＋香蕉、雞胸即食包＋地瓜）
+- 結合動機與下一步：簡短點出處境 → 具體選項 → 一句可執行動作
+- 口吻專業、冷靜、一針見血；不使用 emoji；繁體中文
+- 總長不超過 380 字；勿輸出 JSON 或標題符號"""
+
+
+async def call_openai_jitai_nudge(user_prompt: str) -> str:
+    """以較輕量模型產生可執行的體醒文案（純文字）。"""
+    if not OPENAI_API_KEY:
+        return ""
+    payload = {
+        "model": JITAI_MODEL,
+        "messages": [
+            {"role": "system", "content": PROMPT_JITAI_NUDGE},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 600,
+        "temperature": 0.55,
+    }
+    timeout = httpx.Timeout(45.0, connect=15.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if not resp.is_success:
+            logger.warning("JITAI OpenAI HTTP %s", resp.status_code)
+            return ""
+        resp.raise_for_status()
+        return _openai_extract_message_text(resp.json())
+    except Exception as e:
+        logger.warning("JITAI OpenAI 呼叫失敗: %s", e)
+        return ""
+
+
 async def call_openai_text(system_prompt: str, user_prompt: str) -> dict | str:
     """呼叫 OpenAI 文字 API (無圖片)。"""
     if not OPENAI_API_KEY:
@@ -572,7 +773,14 @@ def compress_image_bytes_to_jpeg_base64(data: bytes, max_side: int = 1280, quali
 async def get_line_image_base64(message_id: str) -> str:
     """下載 LINE 圖片並壓縮為 JPEG base64，供 OpenAI Vision 使用。"""
     raw = await download_line_image_bytes(message_id)
-    return compress_image_bytes_to_jpeg_base64(raw)
+    compress_timeout = float(os.getenv("IMAGE_COMPRESS_TIMEOUT_SEC", "30"))
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(compress_image_bytes_to_jpeg_base64, raw),
+            timeout=compress_timeout,
+        )
+    except asyncio.TimeoutError as e:
+        raise UserFacingError("圖片處理耗時過長，請重新傳送照片。") from e
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -633,7 +841,11 @@ PROMPT_MEAL_ANALYSIS = (
     + """
 
 # 本任務：照片餐點分析
-使用者提供食物照片。必須先完成步驟一（視覺描述）與步驟二（包裝文字），再分類；忽略手部與無關背景。"""
+使用者提供食物照片。必須先完成步驟一（視覺描述）與步驟二（包裝文字），再分類；忽略手部與無關背景。
+
+# 秤重備註（若 user 訊息含實測克數或總重量）
+若使用者提供各品項克數或「總重量／總重」全餐一次秤重，份量【僅能】採用實測值；
+僅有總重量時，依照片品項占比分配各項熟重，加總須等於總重。視覺估計不得覆寫秤重。"""
 )
 
 PROMPT_MEAL_FROM_TEXT = (
@@ -812,18 +1024,41 @@ def _format_meal_macro_g(value: float) -> str:
     return f"{value:.1f}"
 
 
-def _meal_analysis_detail_lines(result: dict, cal: float, pro: float, desc: str) -> list[str]:
+def _meal_text_field(result: dict, key: str) -> str:
+    """安全取出餐點分析 JSON 文字欄位（模型偶爾回傳非字串）。"""
+    val = result.get(key)
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    return str(val).strip()
+
+
+def _meal_analysis_detail_lines(
+    result: dict,
+    cal: float,
+    pro: float,
+    desc: str,
+    scale_weights: list[dict[str, str | float]] | None = None,
+    total_weight_g: float | None = None,
+) -> list[str]:
     """組裝 AI 回傳的 Markdown 分析區塊與數值摘要。"""
-    note = (result.get("estimation_note") or "").strip()
-    breakdown = (result.get("food_breakdown") or "").strip()
-    confidence = (result.get("recognition_confidence") or "").strip()
-    uncertain = (result.get("uncertain_items") or "").strip()
-    confirm = (result.get("user_confirm_prompt") or "").strip()
+    note = _meal_text_field(result, "estimation_note")
+    breakdown = _meal_text_field(result, "food_breakdown")
+    confidence = _meal_text_field(result, "recognition_confidence")
+    uncertain = _meal_text_field(result, "uncertain_items")
+    confirm = _meal_text_field(result, "user_confirm_prompt")
 
     lines = [
         f"食物內容：\n{desc}",
         "",
     ]
+    if scale_weights:
+        lines.append(f"已採用秤重：{_format_scale_weights_summary(scale_weights)}")
+    if total_weight_g is not None:
+        lines.append(f"總重量：{total_weight_g:.0f}g（一次秤重）")
+    if scale_weights or total_weight_g is not None:
+        lines.append("")
     if breakdown:
         lines.extend(["食物拆解明細（簡潔版）", breakdown, ""])
     if confidence:
@@ -1212,12 +1447,14 @@ def handle_set_quick_item(user_id: str, text: str) -> str:
     )
 
 
-async def handle_meal_photo(user_id: str, message_id: str, user_note: str = "") -> str:
+async def handle_meal_photo(
+    user_id: str, message_id: str, user_note: str = "", *, force_scale: bool = False,
+) -> str:
     """處理食物照片：分析＋記錄＋回傳摘要。"""
     image_b64 = await get_line_image_base64(message_id)
-    note_prompt = ""
-    if user_note:
-        note_prompt = f"\n\n使用者補充備註（高優先參考）：\n{user_note[:300]}"
+    note_prompt, scale_weights, total_weight_g = _build_meal_photo_note_prompt(
+        user_note, force_scale=force_scale,
+    )
 
     result = await call_openai_vision(
         system_prompt=PROMPT_MEAL_ANALYSIS,
@@ -1260,7 +1497,11 @@ async def handle_meal_photo(user_id: str, message_id: str, user_note: str = "") 
     lines = [
         "本餐分析結果",
         "————",
-        *_meal_analysis_detail_lines(result, cal, pro, desc),
+        *_meal_analysis_detail_lines(
+            result, cal, pro, desc,
+            scale_weights=scale_weights or None,
+            total_weight_g=total_weight_g,
+        ),
     ]
     lines.extend([
         "",
@@ -2066,6 +2307,273 @@ async def handle_today_summary(user_id: str) -> str:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# JITAI 智能體醒（需手動開啟；門檻觸發 + 窗格收尾最後通牒）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+JITAI_CHECKPOINTS = {
+    "lunch": {
+        "hour": 14,
+        "minute": 0,
+        "slot": "jitai_lunch",
+        "label": "午間檢查",
+        "protein_progress_min": 0.40,
+    },
+    "afternoon": {
+        "hour": 18,
+        "minute": 0,
+        "slot": "jitai_afternoon",
+        "label": "傍晚檢查",
+        "protein_progress_min": 0.65,
+    },
+}
+
+
+def _bot_timezone() -> ZoneInfo:
+    return ZoneInfo((os.getenv("BOT_TIMEZONE") or "Asia/Taipei").strip())
+
+
+def _jitai_window_end_local(d: date, tz: ZoneInfo) -> datetime:
+    end_h = int(os.getenv("JITAI_WINDOW_END_HOUR", "22"))
+    end_m = int(os.getenv("JITAI_WINDOW_END_MINUTE", "0"))
+    return datetime.combine(d, time(end_h, end_m), tzinfo=tz)
+
+
+def _jitai_final_fire_local(d: date, tz: ZoneInfo) -> datetime:
+    mins_before = int(os.getenv("JITAI_FINAL_MINUTES_BEFORE", "75"))
+    end = _jitai_window_end_local(d, tz)
+    return end - timedelta(minutes=mins_before)
+
+
+def _jitai_recent_meal_minutes() -> int:
+    return int(os.getenv("JITAI_RECENT_MEAL_MINUTES", "45"))
+
+
+def _jitai_user_behind(
+    totals: dict,
+    targets: dict,
+    protein_progress_min: float,
+) -> bool:
+    t_pro = float(targets.get("protein") or 0)
+    if t_pro <= 0:
+        return False
+    cur = float(totals.get("protein") or 0)
+    if cur >= t_pro:
+        return False
+    remaining = t_pro - cur
+    if remaining < 12:
+        return False
+    return cur < t_pro * protein_progress_min
+
+
+def _jitai_rule_based_options(remaining_pro: float, urgent: bool) -> str:
+    """AI 失敗時的備援：仍給可執行選項。"""
+    lines = ["可立即補充的選項："]
+    opts: list[str] = []
+    if remaining_pro >= 35:
+        opts.extend([
+            "乳清蛋白飲 1 份（約 +25g 蛋白）",
+            "即食雞胸 150g（約 +35g 蛋白）",
+            "希臘優格 200g ＋ 花生醬 1 湯匙（約 +25g 蛋白）",
+        ])
+    elif remaining_pro >= 18:
+        opts.extend([
+            "水煮蛋 2 顆（約 +12g 蛋白）",
+            "乳清蛋白飲 1 份（約 +25g 蛋白）",
+            "即食雞胸 100g（約 +23g 蛋白）",
+        ])
+    else:
+        opts.extend([
+            "水煮蛋 1 顆（約 +6g 蛋白）",
+            "無糖豆漿 450ml（約 +15g 蛋白）",
+            "希臘優格 150g（約 +15g 蛋白）",
+        ])
+    for i, o in enumerate(opts[:3], 1):
+        lines.append(f"{i}. {o}")
+    if urgent:
+        lines.append("\n今日紀錄窗格即將關閉，請選一項最快能拿到的先補上。")
+    else:
+        lines.append("\n選一項最順手的先補，補完拍張照或傳「加蛋白飲」記錄。")
+    return "\n".join(lines)
+
+
+async def _build_jitai_nudge_message(
+    user_id: str,
+    local_date_s: str,
+    checkpoint: str,
+    *,
+    urgent: bool = False,
+) -> str:
+    totals = db.get_daily_totals(user_id, local_date_s)
+    targets = get_user_targets(user_id)
+    profile = db.get_user_profile(user_id) or {}
+    goal = _profile_fitness_goal(profile)
+    remaining_pro = max(0.0, float(targets["protein"]) - float(totals["protein"]))
+    remaining_cal = float(targets["calories"]) - float(totals["calories"])
+
+    tz = _bot_timezone()
+    now_local = datetime.now(timezone.utc).astimezone(tz)
+    window_end = _jitai_window_end_local(now_local.date(), tz)
+    mins_left = max(0, int((window_end - now_local).total_seconds() // 60))
+
+    meals = db.get_meals_today(user_id, local_date_s)
+    meal_lines = []
+    for m in meals[-4:]:
+        meal_lines.append(
+            f"- {m.get('food_description', '?')} "
+            f"（{float(m.get('protein') or 0):.0f}g 蛋白）"
+        )
+    meals_ctx = "\n".join(meal_lines) if meal_lines else "（今日尚無紀錄）"
+
+    cp_label = JITAI_CHECKPOINTS.get(checkpoint, {}).get("label", checkpoint)
+    urgency = (
+        "這是今日紀錄窗格關閉前的最後體醒，請聚焦最快能補上的組合，語氣可更緊迫。"
+        if urgent
+        else "僅在進度落後時觸發；請給務實、可馬上執行的建議。"
+    )
+    user_prompt = (
+        f"檢查點：{cp_label}\n"
+        f"健身目標：{goal}\n"
+        f"今日已攝取蛋白質：{totals['protein']:.0f} g／目標 {targets['protein']:.0f} g\n"
+        f"尚缺蛋白質：約 {remaining_pro:.0f} g\n"
+        f"今日已攝取熱量：{totals['calories']:.0f} kcal／目標 {targets['calories']:.0f} kcal\n"
+        f"熱量剩餘空間：約 {remaining_cal:.0f} kcal\n"
+        f"距離今日窗格結束還有約 {mins_left} 分鐘\n"
+        f"{urgency}\n\n"
+        f"今日已記錄餐點：\n{meals_ctx}"
+    )
+
+    ai_text = await call_openai_jitai_nudge(user_prompt)
+    ai_text = (ai_text or "").strip()
+    if ai_text:
+        header = "【智能體醒"
+        if urgent:
+            header += "｜今日最後補充窗口"
+        header += "】\n"
+        return truncate_line_text(header + ai_text)
+
+    fallback_intro = (
+        f"蛋白質尚缺約 {remaining_pro:.0f} g，距離今日窗格結束約 {mins_left} 分鐘。\n\n"
+        if remaining_pro > 0
+        else f"今日蛋白質已達標；距離窗格結束約 {mins_left} 分鐘，維持記錄節奏即可。\n\n"
+    )
+    return truncate_line_text(
+        "【智能體醒" + ("｜今日最後補充窗口" if urgent else "") + "】\n"
+        + fallback_intro
+        + _jitai_rule_based_options(remaining_pro, urgent=urgent)
+    )
+
+
+def handle_jitai_toggle(user_id: str, enabled: bool) -> str:
+    if not db.is_onboarded(user_id):
+        return ONBOARDING_BLOCKED_TEXT
+    db.set_jitai_nudges_enabled(user_id, enabled)
+    if enabled:
+        tz = _bot_timezone()
+        end = _jitai_window_end_local(date.today(), tz)
+        final = _jitai_final_fire_local(date.today(), tz)
+        return (
+            "已開啟智能體醒（JITAI）。\n\n"
+            "運作方式：\n"
+            "· 僅在你進度真的落後時才推送（不會每天固定時間唸數字）\n"
+            "· 內容為可馬上執行的補充組合，而非單純報告缺口\n"
+            f"· 每日 {final.strftime('%H:%M')} 有一次最後補充提醒（窗格 {end.strftime('%H:%M')} 前）\n\n"
+            "傳「關閉體醒」可隨時關閉。"
+        )
+    return "已關閉智能體醒，不會再收到進度體醒推播。"
+
+
+def handle_jitai_status(user_id: str) -> str:
+    if not db.is_onboarded(user_id):
+        return ONBOARDING_BLOCKED_TEXT
+    on = db.jitai_nudges_enabled(user_id)
+    tz = _bot_timezone()
+    end = _jitai_window_end_local(date.today(), tz)
+    final = _jitai_final_fire_local(date.today(), tz)
+    return (
+        "智能體醒狀態\n"
+        "————\n"
+        f"目前：{'已開啟' if on else '已關閉（預設）'}\n\n"
+        "檢查點（僅落後時推送）：\n"
+        "· 14:00 午間\n"
+        "· 18:00 傍晚\n"
+        f"最後補充：{final.strftime('%H:%M')}（窗格 {end.strftime('%H:%M')} 前，必定推送）\n\n"
+        "指令：開啟體醒／關閉體醒"
+    )
+
+
+async def execute_jitai_nudge_push(checkpoint: str) -> dict:
+    """
+    JITAI 體醒批次推播。
+    checkpoint: lunch｜afternoon｜final
+    """
+    if checkpoint not in (*JITAI_CHECKPOINTS.keys(), "final"):
+        return {"error": f"unknown_checkpoint: {checkpoint}"}
+
+    tz = _bot_timezone()
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(tz)
+    local_date_s = now_local.date().isoformat()
+    urgent = checkpoint == "final"
+
+    user_ids = db.get_user_ids_with_jitai_enabled()
+    ok, skip, fail = 0, 0, 0
+    configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+    recent_min = _jitai_recent_meal_minutes()
+
+    async with AsyncApiClient(configuration) as api_client:
+        line_api = AsyncMessagingApi(api_client)
+        for uid in user_ids:
+            try:
+                slot = (
+                    JITAI_CHECKPOINTS[checkpoint]["slot"]
+                    if checkpoint in JITAI_CHECKPOINTS
+                    else "jitai_final"
+                )
+                if db.reminder_already_sent(uid, local_date_s, slot):
+                    skip += 1
+                    continue
+
+                totals = db.get_daily_totals(uid, local_date_s)
+                targets = get_user_targets(uid)
+
+                if not urgent:
+                    prog_min = JITAI_CHECKPOINTS[checkpoint]["protein_progress_min"]
+                    if not _jitai_user_behind(totals, targets, prog_min):
+                        skip += 1
+                        continue
+                    if db.user_had_meal_in_recent_minutes(
+                        uid, local_date_s, recent_min, end_utc_iso=now_utc.isoformat()
+                    ):
+                        skip += 1
+                        continue
+
+                text = await _build_jitai_nudge_message(
+                    uid, local_date_s, checkpoint, urgent=urgent,
+                )
+                await line_api.push_message(
+                    PushMessageRequest(
+                        to=uid,
+                        messages=[TextMessage(text=text)],
+                    )
+                )
+                db.mark_reminder_sent(uid, local_date_s, slot)
+                ok += 1
+                logger.info("已推播 JITAI 體醒（%s）給 %s...", checkpoint, uid[:8])
+            except Exception as e:
+                fail += 1
+                logger.error("JITAI 體醒推播失敗 %s: %s", uid[:8], e)
+
+    return {
+        "checkpoint": checkpoint,
+        "date": local_date_s,
+        "users_enabled": len(user_ids),
+        "pushed_ok": ok,
+        "skipped": skip,
+        "pushed_fail": fail,
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 定時推播（建議由 GitHub Actions 呼叫 /cron/daily-summary）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -2342,6 +2850,7 @@ async def _analyze_image_by_state(
     message_id: str,
     state_at_receive: str,
     user_note: str = "",
+    force_scale: bool = False,
 ) -> str:
     if state_at_receive == UserState.WAITING_PURCHASE_PHOTO:
         return await handle_purchase_query_photo(user_id, message_id)
@@ -2354,44 +2863,45 @@ async def _analyze_image_by_state(
         return await handle_inbody_photo(user_id, message_id)
     if not db.is_onboarded(user_id):
         return ONBOARDING_BLOCKED_TEXT
-    return await handle_meal_photo(user_id, message_id, user_note=user_note)
-
-
-def _log_image_background_task(task: asyncio.Task) -> None:
-    """create_task 預設吞掉例外；在此記錄，避免圖片分析靜默失敗。"""
-    try:
-        exc = task.exception()
-    except asyncio.CancelledError:
-        return
-    if exc is not None:
-        logger.error("背景圖片分析任務失敗: %s", exc, exc_info=exc)
+    return await handle_meal_photo(
+        user_id, message_id, user_note=user_note, force_scale=force_scale,
+    )
 
 
 async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_receive: str):
     """背景執行：下載、壓縮、Vision、寫入 DB，完成後 push 結果。"""
-    timeout_sec = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "120"))
-    note_wait_sec = float(os.getenv("PHOTO_NOTE_WINDOW_SEC", "5"))
+    timeout_sec = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "180"))
+    note_wait_sec = _photo_note_window_sec()
+    analyze_timeout = max(60.0, timeout_sec - note_wait_sec)
+    body = ""
     logger.info(
-        "圖片分析開始 user=%s msg=%s state=%s timeout=%.0fs",
+        "圖片分析開始 user=%s msg=%s state=%s total=%.0fs analyze=%.0fs",
         user_id[:8],
         message_id,
         state_at_receive,
         timeout_sec,
+        analyze_timeout,
     )
     try:
         user_note = ""
+        force_scale = False
         skip_note = state_at_receive in (
             UserState.WAITING_PURCHASE_PHOTO,
             UserState.WAITING_INBODY_PHOTO,
             UserState.ONBOARDING_WAITING_GOAL,
         ) or db.needs_inbody(user_id)
         if not skip_note:
-            user_note = await wait_and_take_pending_note(user_id, message_id, note_wait_sec)
+            user_note, force_scale = await wait_and_take_pending_note(
+                user_id, message_id, note_wait_sec,
+            )
             if user_note:
                 logger.info("圖片分析附加使用者備註 user=%s msg=%s", user_id[:8], message_id)
         body = await asyncio.wait_for(
-            _analyze_image_by_state(user_id, message_id, state_at_receive, user_note=user_note),
-            timeout=timeout_sec,
+            _analyze_image_by_state(
+                user_id, message_id, state_at_receive,
+                user_note=user_note, force_scale=force_scale,
+            ),
+            timeout=analyze_timeout,
         )
         logger.info("圖片分析完成 user=%s msg=%s", user_id[:8], message_id)
     except asyncio.TimeoutError:
@@ -2400,17 +2910,25 @@ async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_re
             "本次圖片分析耗時過長，已自動中止。\n"
             "請重新傳一次照片（盡量清晰、只拍重點），我會立即重跑。"
         )
+    except asyncio.CancelledError:
+        logger.error("圖片分析任務被取消 user=%s msg=%s", user_id[:8], message_id)
+        if not body.strip():
+            body = "分析尚未完成（可能因服務重啟），請重新傳送照片。"
+        raise
     except UserFacingError as e:
         logger.warning("圖片分析可恢復錯誤 user=%s msg=%s err=%s", user_id[:8], message_id, e)
         body = str(e)
     except Exception as e:
         logger.error("背景圖片分析失敗: %s", e, exc_info=True)
         body = "分析過程發生錯誤，請稍後再試或重新傳送照片。"
-    try:
-        await push_line_text_with_retry(user_id, body, attempts=3)
-        logger.info("圖片分析結果已推送 user=%s msg=%s", user_id[:8], message_id)
-    except Exception as e:
-        logger.error("Push 分析結果失敗: %s", e, exc_info=True)
+    finally:
+        if not (body or "").strip():
+            body = "分析完成但未產生結果，請重新傳送照片。"
+        try:
+            await push_line_text_with_retry(user_id, body, attempts=3)
+            logger.info("圖片分析結果已推送 user=%s msg=%s", user_id[:8], message_id)
+        except Exception as e:
+            logger.error("Push 分析結果失敗 user=%s msg=%s: %s", user_id[:8], message_id, e, exc_info=True)
 
 
 HELP_TEXT = (
@@ -2421,7 +2939,11 @@ HELP_TEXT = (
     "基本操作：\n"
     "  拍照傳食物，將自動分析並記錄（熱量為減脂保守估計）。\n"
     "  文字報餐：以「記錄」「記一筆」或「吃」開頭＋描述（例：記錄 雞腿飯半個＋燙青菜）。\n\n"
-    "  傳完照片後 5 秒內可補「備註：...」（例：備註：這是雞胸肉不是豬排）。\n\n"
+    "  傳完照片後 10 秒內可補備註／備注，例如：\n"
+    "    備註：這是雞胸肉不是豬排\n"
+    "    秤重：雞胸150g、米飯180g、總重量：450g\n"
+    "    備注：炸雞、高麗菜、泡麵，總重量：520g（僅一次秤重時寫總重量）\n"
+    "    克數 雞胸 150、泡麵 50（品名＋克數，建議加 g 或克）\n\n"
     "文字指令：\n"
     "  「今日」：查看今日總結\n"
     "  「清除今日」：刪除今日所有紀錄\n"
@@ -2430,6 +2952,10 @@ HELP_TEXT = (
     "  「Notion狀態」：檢查目前是否會同步到 Notion\n"
     "  「我的ID」：顯示你的 LINE userId（可用於比對 NOTION_SYNC_USER_ID）\n"
     "  「說明」：顯示此說明\n\n"
+    "智能體醒 JITAI（預設關閉，需手動開啟）：\n"
+    "  「開啟體醒」：僅進度落後時推送可執行補充建議\n"
+    "  「關閉體醒」：停止體醒推播\n"
+    "  「體醒狀態」：查看是否已開啟與檢查時段\n\n"
     "圖文選單：\n"
     "  「食物查詢」或「購買查詢」：買前先查熱量等級\n"
     "  「加蛋白飲」：一鍵記錄一份蛋白飲（不耗 AI）\n"
@@ -2445,7 +2971,7 @@ HELP_TEXT = (
 
 
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     signature = request.headers.get("X-Line-Signature", "")
     body = (await request.body()).decode("utf-8")
 
@@ -2514,13 +3040,15 @@ async def webhook(request: Request):
                         UserState.WAITING_PURCHASE_PHOTO,
                         UserState.WAITING_INBODY_PHOTO,
                     ) and not db.needs_inbody(user_id):
-                        await create_pending_note_window(user_id, event.message.id, window_sec=5.0)
-                    bg = asyncio.create_task(
-                        run_image_analysis_and_push(
-                            user_id, event.message.id, snap_state
+                        await create_pending_note_window(
+                            user_id, event.message.id, window_sec=_photo_note_window_sec(),
                         )
+                    background_tasks.add_task(
+                        run_image_analysis_and_push,
+                        user_id,
+                        event.message.id,
+                        snap_state,
                     )
-                    bg.add_done_callback(_log_image_background_task)
                 else:
                     reply_text = await route_message(event, user_id, state)
             except Exception as e:
@@ -2558,9 +3086,11 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
     # ── 文字訊息 ──
     if isinstance(event.message, TextMessageContent):
         text = event.message.text.replace("\u3000", " ").strip()
-        note_text = _extract_note_text(text)
-        if note_text:
-            ok, msg = await add_pending_note_if_open(user_id, note_text)
+        note_text, is_scale_prefix = _extract_note_text(text)
+        if note_text is not None:
+            ok, msg = await add_pending_note_if_open(
+                user_id, note_text, force_scale=is_scale_prefix,
+            )
             if ok:
                 return msg
 
@@ -2606,6 +3136,20 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
         if text in ("說明", "幫助", "help", "Help", "HELP"):
             leave_photo_wait_if_any(user_id)
             return HELP_TEXT
+
+        if text in (
+            "開啟體醒", "開啟智能體醒", "開啟JITAI", "開啟 JITAI", "開啟jitai體醒",
+        ):
+            leave_photo_wait_if_any(user_id)
+            return handle_jitai_toggle(user_id, True)
+
+        if text in ("關閉體醒", "關閉智能體醒", "關閉JITAI", "關閉 JITAI"):
+            leave_photo_wait_if_any(user_id)
+            return handle_jitai_toggle(user_id, False)
+
+        if text in ("體醒狀態", "查詢體醒", "智能體醒狀態"):
+            leave_photo_wait_if_any(user_id)
+            return handle_jitai_status(user_id)
 
         if text in ("今日", "今日總計", "今日總結", "總計", "今天"):
             leave_photo_wait_if_any(user_id)
@@ -2825,6 +3369,35 @@ async def cron_meal_reminder(request: Request):
                 "ok": False,
                 "error": f"cron_meal_reminder_failed: {e}",
                 "slot": slot or "both",
+            }
+        )
+
+
+@app.post("/cron/jitai-nudge")
+async def cron_jitai_nudge(request: Request):
+    """
+    智能體醒 JITAI（僅已開啟者）：
+    - /cron/jitai-nudge?checkpoint=lunch
+    - /cron/jitai-nudge?checkpoint=afternoon
+    - /cron/jitai-nudge?checkpoint=final
+    """
+    _verify_cron_secret_or_401(request)
+    checkpoint = (request.query_params.get("checkpoint") or "").strip().lower()
+    if checkpoint not in ("lunch", "afternoon", "final"):
+        raise HTTPException(
+            status_code=400,
+            detail="checkpoint 須為 lunch、afternoon 或 final",
+        )
+    try:
+        result = await execute_jitai_nudge_push(checkpoint)
+        return JSONResponse(content={"ok": True, "checkpoint": checkpoint, "result": result})
+    except Exception as e:
+        logger.error("cron jitai-nudge 執行失敗: %s", e, exc_info=True)
+        return JSONResponse(
+            content={
+                "ok": False,
+                "error": f"cron_jitai_nudge_failed: {e}",
+                "checkpoint": checkpoint,
             }
         )
 

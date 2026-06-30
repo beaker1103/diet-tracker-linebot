@@ -1,0 +1,79 @@
+# 台灣時間 JITAI 智能體醒（僅已「開啟體醒」使用者）
+# 14:00 午間門檻｜18:00 傍晚門檻｜20:45 窗格收尾最後通牒
+# 需設定：RENDER_BASE_URL、CRON_SECRET
+
+name: JITAI nudge
+
+on:
+  schedule:
+    - cron: "0 6 * * *"    # 14:00 Asia/Taipei
+    - cron: "0 10 * * *"   # 18:00 Asia/Taipei
+    - cron: "45 12 * * *"  # 20:45 Asia/Taipei
+  workflow_dispatch:
+    inputs:
+      checkpoint:
+        description: "lunch | afternoon | final"
+        required: true
+        default: lunch
+
+jobs:
+  trigger-render-cron:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve checkpoint
+        id: cp
+        env:
+          INPUT_CP: ${{ github.event.inputs.checkpoint }}
+        run: |
+          if [ -n "$INPUT_CP" ]; then
+            echo "checkpoint=$INPUT_CP" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          hour=$(date -u +'%H')
+          min=$(date -u +'%M')
+          if [ "$hour" = "06" ]; then
+            echo "checkpoint=lunch" >> "$GITHUB_OUTPUT"
+          elif [ "$hour" = "10" ]; then
+            echo "checkpoint=afternoon" >> "$GITHUB_OUTPUT"
+          elif [ "$hour" = "12" ] && [ "$min" -ge 45 ]; then
+            echo "checkpoint=final" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkpoint=lunch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: POST jitai-nudge
+        env:
+          BASE_URL: ${{ secrets.RENDER_BASE_URL }}
+          SECRET: ${{ secrets.CRON_SECRET }}
+          CHECKPOINT: ${{ steps.cp.outputs.checkpoint }}
+        run: |
+          if [ -z "$BASE_URL" ] || [ -z "$SECRET" ]; then
+            echo "::error::請設定 Actions secrets：RENDER_BASE_URL、CRON_SECRET"
+            exit 1
+          fi
+          BASE_URL="$(echo -n "$BASE_URL" | tr -d '\r\n\t ')"
+          BASE_URL="${BASE_URL%/}"
+          BASE_URL="${BASE_URL%/cron/daily-summary}"
+          BASE_URL="${BASE_URL%/cron/meal-reminder}"
+          BASE_URL="${BASE_URL%/cron/jitai-nudge}"
+          BASE_URL="${BASE_URL%/cron/db-keepalive}"
+          URL="${BASE_URL}/cron/jitai-nudge?checkpoint=${CHECKPOINT}"
+          case "$URL" in
+            http://*|https://*) ;;
+            *)
+              echo "::error::RENDER_BASE_URL 格式錯誤"
+              exit 1
+              ;;
+          esac
+          tmp="$(mktemp)"
+          code=$(curl -sS -X POST "$URL" \
+            -H "X-Cron-Secret: $SECRET" \
+            -H "Content-Type: application/json" \
+            --retry 4 --retry-all-errors --retry-delay 5 \
+            -o "$tmp" -w "%{http_code}")
+          echo "checkpoint=$CHECKPOINT HTTP $code"
+          cat "$tmp"
+          if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "::error::jitai-nudge failed with HTTP $code"
+            exit 1
+          fi
