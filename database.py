@@ -647,7 +647,7 @@ class Database:
         self._migrate_user_message_log_kind()
 
     def _migrate_user_profiles_jitai(self):
-        """補上 jitai_nudges_enabled（智能體醒，預設關閉、需手動開啟）。"""
+        """補上 jitai_nudges_enabled（智能提醒，預設關閉、需手動開啟）。"""
         conn = self._connect()
         try:
             if self._pg:
@@ -1258,7 +1258,7 @@ class Database:
         minutes: int,
         end_utc_iso: str | None = None,
     ) -> bool:
-        """今日餐點中，是否有在過去 minutes 分鐘內入帳（避免剛吃完又體醒）。"""
+        """今日餐點中，是否有在過去 minutes 分鐘內入帳（避免剛吃完又提醒）。"""
         end_dt = (
             datetime.fromisoformat(end_utc_iso.replace("Z", "+00:00"))
             if end_utc_iso
