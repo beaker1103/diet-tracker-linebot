@@ -10,6 +10,7 @@ import base64
 import hmac
 import logging
 import asyncio
+import unicodedata
 from io import BytesIO
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -153,13 +154,40 @@ def clear_state(user_id: str):
 
 
 def parse_fitness_goal(text: str) -> str | None:
-    t = text.strip().replace("\u3000", " ").replace(" ", "")
-    if t in FITNESS_GOAL_ALIASES:
-        return FITNESS_GOAL_ALIASES[t]
+    t = _compact_command(text)
+    for alias, goal in FITNESS_GOAL_ALIASES.items():
+        if t == _compact_command(alias):
+            return goal
     for key in FITNESS_GOALS:
-        if t == key:
+        if t == _compact_command(key):
             return key
     return None
+
+
+def _compact_command(text: str) -> str:
+    """指令比對用：全形轉半形、移除所有空白。"""
+    t = unicodedata.normalize("NFKC", (text or "").replace("\u3000", " "))
+    return re.sub(r"\s+", "", t.strip())
+
+
+JITAI_ON_COMMANDS = {
+    _compact_command(x)
+    for x in (
+        "開啟體醒", "開啟智能體醒", "開啟JITAI", "開啟jitai體醒",
+        "開啟提醒", "開啟智能提醒", "開啟jitai提醒",
+    )
+}
+JITAI_OFF_COMMANDS = {
+    _compact_command(x)
+    for x in (
+        "關閉體醒", "關閉智能體醒", "關閉JITAI", "關閉jitai體醒",
+        "關閉提醒", "關閉智能提醒",
+    )
+}
+JITAI_STATUS_COMMANDS = {
+    _compact_command(x)
+    for x in ("體醒狀態", "查詢體醒", "智能體醒狀態", "提醒狀態", "查詢提醒")
+}
 
 
 def _profile_fitness_goal(profile: dict | None) -> str:
@@ -2953,7 +2981,7 @@ HELP_TEXT = (
     "  「我的ID」：顯示你的 LINE userId（可用於比對 NOTION_SYNC_USER_ID）\n"
     "  「說明」：顯示此說明\n\n"
     "智能體醒 JITAI（預設關閉，需手動開啟）：\n"
-    "  「開啟體醒」：僅進度落後時推送可執行補充建議\n"
+    "  「開啟體醒」或「開啟提醒」：僅進度落後時推送可執行補充建議\n"
     "  「關閉體醒」：停止體醒推播\n"
     "  「體醒狀態」：查看是否已開啟與檢查時段\n\n"
     "圖文選單：\n"
@@ -3137,17 +3165,15 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
             leave_photo_wait_if_any(user_id)
             return HELP_TEXT
 
-        if text in (
-            "開啟體醒", "開啟智能體醒", "開啟JITAI", "開啟 JITAI", "開啟jitai體醒",
-        ):
+        if _compact_command(text) in JITAI_ON_COMMANDS:
             leave_photo_wait_if_any(user_id)
             return handle_jitai_toggle(user_id, True)
 
-        if text in ("關閉體醒", "關閉智能體醒", "關閉JITAI", "關閉 JITAI"):
+        if _compact_command(text) in JITAI_OFF_COMMANDS:
             leave_photo_wait_if_any(user_id)
             return handle_jitai_toggle(user_id, False)
 
-        if text in ("體醒狀態", "查詢體醒", "智能體醒狀態"):
+        if _compact_command(text) in JITAI_STATUS_COMMANDS:
             leave_photo_wait_if_any(user_id)
             return handle_jitai_status(user_id)
 
@@ -3422,7 +3448,17 @@ async def cron_db_keepalive(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    commit = (
+        os.getenv("RENDER_GIT_COMMIT")
+        or os.getenv("GIT_COMMIT")
+        or "local"
+    )[:12]
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "commit": commit,
+        "features": ["jitai_nudge", "scale_note", "onboarding"],
+    }
 
 
 if __name__ == "__main__":
