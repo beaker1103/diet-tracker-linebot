@@ -62,6 +62,10 @@ GENERAL_GRADES = ["S", "A", "B", "C", "D", "E"]
 
 DEFAULT_PROTEIN_TARGET = 220  # g（無 InBody 時兜底；有體重時由 calculate_targets 重算）
 DEFAULT_CALORIE_TARGET = 2500  # kcal
+CHEAT_DAY_CALORIE_MULTIPLIER = 1.3
+DEFAULT_CALORIE_ADJUST_STEP = 150  # 「降低熱量」預設幅度（kcal）
+MIN_CALORIE_TARGET = 1400
+MAX_CALORIE_TARGET = 5500
 
 FITNESS_GOALS = ("增肌", "減脂", "增肌減脂", "維持", "增肥")
 FITNESS_GOAL_ALIASES = {
@@ -162,6 +166,87 @@ def parse_fitness_goal(text: str) -> str | None:
         if t == _compact_command(key):
             return key
     return None
+
+
+def parse_calorie_adjust(text: str) -> tuple[str, int | None] | None:
+    """解析熱量微調指令。回傳 (動作, 幅度)；reset 時幅度為 None。"""
+    c = _compact_command(text)
+    if c in ("重設熱量調整", "重設熱量", "取消熱量調整"):
+        return ("reset", None)
+    for prefix in ("降低熱量", "減少熱量", "熱量降低"):
+        if c == prefix:
+            return ("lower", DEFAULT_CALORIE_ADJUST_STEP)
+        if c.startswith(prefix):
+            tail = c[len(prefix):]
+            if tail.isdigit():
+                return ("lower", int(tail))
+    for prefix in ("提高熱量", "增加熱量", "熱量提高"):
+        if c == prefix:
+            return ("raise", DEFAULT_CALORIE_ADJUST_STEP)
+        if c.startswith(prefix):
+            tail = c[len(prefix):]
+            if tail.isdigit():
+                return ("raise", int(tail))
+    return None
+
+
+def _apply_calorie_offset(base_cal: int, offset: int) -> int:
+    return max(MIN_CALORIE_TARGET, min(MAX_CALORIE_TARGET, base_cal + offset))
+
+
+def _base_targets_from_profile(profile: dict) -> dict:
+    return calculate_targets(
+        profile.get("weight"),
+        profile.get("body_fat_percentage"),
+        profile.get("bmr"),
+        profile.get("tdee"),
+        fitness_goal=_profile_fitness_goal(profile),
+    )
+
+
+async def handle_calorie_adjust(user_id: str, action: str, amount: int | None) -> str:
+    """個人熱量目標微調（在公式計算結果上累加 offset）。"""
+    profile = db.get_user_profile(user_id)
+    if not profile or not profile.get("weight"):
+        return ONBOARDING_BLOCKED_TEXT
+
+    base_targets = _base_targets_from_profile(profile)
+    base = base_targets["calories"]
+    current_offset = int(profile.get("calorie_offset") or 0)
+
+    if action == "reset":
+        new_offset = 0
+        msg_action = "已重設個人熱量微調"
+    elif action == "lower":
+        step = amount or DEFAULT_CALORIE_ADJUST_STEP
+        new_offset = current_offset - step
+        floor_offset = MIN_CALORIE_TARGET - base
+        if new_offset < floor_offset:
+            new_offset = floor_offset
+        msg_action = f"已降低熱量目標 {step} kcal"
+    else:
+        step = amount or DEFAULT_CALORIE_ADJUST_STEP
+        new_offset = current_offset + step
+        msg_action = f"已提高熱量目標 {step} kcal"
+
+    db.set_calorie_offset(user_id, new_offset)
+    final_cal = _apply_calorie_offset(base, new_offset)
+
+    lines = [
+        msg_action,
+        "=" * 24,
+        f"公式計算：{base:.0f} kcal",
+    ]
+    if new_offset:
+        sign = "+" if new_offset > 0 else ""
+        lines.append(f"個人微調：{sign}{new_offset} kcal")
+    else:
+        lines.append("個人微調：無")
+    lines.append(f"每日熱量目標：{final_cal:.0f} kcal")
+    lines.append(f"每日蛋白質目標：{base_targets['protein']:.0f} g（不變）")
+    if action == "lower" and new_offset == MIN_CALORIE_TARGET - base:
+        lines.append("\n已達系統允許的最低熱量下限，無法再降低。")
+    return "\n".join(lines)
 
 
 def _compact_command(text: str) -> str:
@@ -1120,13 +1205,19 @@ def get_user_targets(user_id: str) -> dict:
         try:
             wf = float(w)
             if wf > 0:
-                return calculate_targets(
+                targets = calculate_targets(
                     wf,
                     profile.get("body_fat_percentage"),
                     profile.get("bmr"),
                     profile.get("tdee"),
                     fitness_goal=_profile_fitness_goal(profile),
                 )
+                offset = int(profile.get("calorie_offset") or 0)
+                if offset:
+                    targets["calories"] = _apply_calorie_offset(
+                        int(targets["calories"]), offset,
+                    )
+                return targets
         except (TypeError, ValueError):
             pass
     cal = profile.get("daily_calorie_target")
@@ -1135,6 +1226,34 @@ def get_user_targets(user_id: str) -> dict:
         "calories": float(cal) if cal is not None else DEFAULT_CALORIE_TARGET,
         "protein": float(pro) if pro is not None else DEFAULT_PROTEIN_TARGET,
     }
+
+
+def get_daily_calorie_target(user_id: str, date_str: str) -> float:
+    """當日有效熱量目標（欺騙日放寬至 ×1.3）。"""
+    cal = float(get_user_targets(user_id)["calories"])
+    if db.is_cheat_day(user_id, date_str):
+        cal *= CHEAT_DAY_CALORIE_MULTIPLIER
+    return cal
+
+
+def _format_daily_calorie_summary_lines(
+    user_id: str, today_str: str, totals: dict,
+) -> tuple[str, str]:
+    """回傳今日累計的（總熱量行, 剩餘熱量行）。"""
+    cal_target = get_daily_calorie_target(user_id, today_str)
+    is_cheat = db.is_cheat_day(user_id, today_str)
+    remaining_cal = cal_target - float(totals["calories"])
+    if is_cheat:
+        total_line = f"總熱量：{totals['calories']:.0f}／{cal_target:.0f} kcal"
+    else:
+        total_line = f"總熱量：{totals['calories']:.0f} kcal"
+    if remaining_cal >= 0:
+        rem_line = f"剩餘熱量：約 {remaining_cal:.0f} kcal"
+    else:
+        rem_line = f"熱量狀態：已超過目標約 {-remaining_cal:.0f} kcal"
+    if is_cheat:
+        rem_line += "（欺騙日）"
+    return total_line, rem_line
 
 
 def get_gap_filler(remaining_protein: float) -> str:
@@ -1417,11 +1536,8 @@ async def handle_quick_protein(user_id: str, item_name: str = "蛋白飲") -> st
     totals = db.get_daily_totals(user_id, today_str)
     targets = get_user_targets(user_id)
     remaining = targets["protein"] - totals["protein"]
-    remaining_cal = targets["calories"] - totals["calories"]
-    remaining_cal_line = (
-        f"剩餘熱量：約 {remaining_cal:.0f} kcal"
-        if remaining_cal >= 0
-        else f"熱量狀態：已超過目標約 {-remaining_cal:.0f} kcal"
+    total_cal_line, remaining_cal_line = _format_daily_calorie_summary_lines(
+        user_id, today_str, totals,
     )
     bar = build_progress_bar(totals["protein"], targets["protein"])
     gap = get_gap_filler(remaining)
@@ -1431,7 +1547,7 @@ async def handle_quick_protein(user_id: str, item_name: str = "蛋白飲") -> st
         f"＋{cal:.0f} kcal／＋{pro:.0f} g 蛋白質\n"
         f"————\n"
         f"今日累計：\n"
-        f"總熱量：{totals['calories']:.0f} kcal\n"
+        f"{total_cal_line}\n"
         f"{remaining_cal_line}\n"
         f"總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g\n"
         f"{bar}\n\n"
@@ -1513,11 +1629,8 @@ async def handle_meal_photo(
     totals = db.get_daily_totals(user_id, today_str)
     targets = get_user_targets(user_id)
     remaining = targets["protein"] - totals["protein"]
-    remaining_cal = targets["calories"] - totals["calories"]
-    remaining_cal_line = (
-        f"剩餘熱量：約 {remaining_cal:.0f} kcal"
-        if remaining_cal >= 0
-        else f"熱量狀態：已超過目標約 {-remaining_cal:.0f} kcal"
+    total_cal_line, remaining_cal_line = _format_daily_calorie_summary_lines(
+        user_id, today_str, totals,
     )
     bar = build_progress_bar(totals["protein"], targets["protein"])
     gap = get_gap_filler(remaining)
@@ -1535,7 +1648,7 @@ async def handle_meal_photo(
         "",
         "————",
         "今日累計：",
-        f"總熱量：{totals['calories']:.0f} kcal",
+        total_cal_line,
         remaining_cal_line,
         f"總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g",
         f"{bar}",
@@ -1584,11 +1697,8 @@ async def handle_meal_from_text(user_id: str, user_said: str) -> str:
     totals = db.get_daily_totals(user_id, today_str)
     targets = get_user_targets(user_id)
     remaining = targets["protein"] - totals["protein"]
-    remaining_cal = targets["calories"] - totals["calories"]
-    remaining_cal_line = (
-        f"剩餘熱量：約 {remaining_cal:.0f} kcal"
-        if remaining_cal >= 0
-        else f"熱量狀態：已超過目標約 {-remaining_cal:.0f} kcal"
+    total_cal_line, remaining_cal_line = _format_daily_calorie_summary_lines(
+        user_id, today_str, totals,
     )
     bar = build_progress_bar(totals["protein"], targets["protein"])
     gap = get_gap_filler(remaining)
@@ -1602,7 +1712,7 @@ async def handle_meal_from_text(user_id: str, user_said: str) -> str:
         "",
         "————",
         "今日累計：",
-        f"總熱量：{totals['calories']:.0f} kcal",
+        total_cal_line,
         remaining_cal_line,
         f"總蛋白質：{totals['protein']:.0f} g／{targets['protein']:.0f} g",
         f"{bar}",
@@ -2166,12 +2276,13 @@ async def handle_cheat_day(user_id: str) -> str:
         # 已經是欺騙日
         totals = db.get_daily_totals(user_id, today_str)
         targets = get_user_targets(user_id)
-        cheat_cal = targets["calories"] * 1.3
+        normal_cal = float(targets["calories"])
+        cheat_cal = get_daily_calorie_target(user_id, today_str)
 
         return (
             f"今天已經是欺騙日模式\n"
             f"{'=' * 24}\n"
-            f"正常熱量上限：{targets['calories']:.0f} kcal\n"
+            f"正常熱量上限：{normal_cal:.0f} kcal\n"
             f"欺騙日上限：{cheat_cal:.0f} kcal\n"
             f"目前已攝取：{totals['calories']:.0f} kcal\n\n"
             f"提醒：欺騙日不代表無限制，\n"
@@ -2190,13 +2301,14 @@ async def handle_cheat_day(user_id: str) -> str:
     # 啟動欺騙日
     db.activate_cheat_day(user_id, today_str)
     targets = get_user_targets(user_id)
-    cheat_cal = targets["calories"] * 1.3
+    normal_cal = float(targets["calories"])
+    cheat_cal = get_daily_calorie_target(user_id, today_str)
 
     return (
         f"欺騙日模式已啟動\n"
         f"{'=' * 24}\n"
         f"今日熱量上限放寬至：{cheat_cal:.0f} kcal\n"
-        f"（正常：{targets['calories']:.0f} kcal，＋{cheat_cal - targets['calories']:.0f}）\n\n"
+        f"（正常：{normal_cal:.0f} kcal，＋{cheat_cal - normal_cal:.0f}）\n\n"
         f"規則：\n"
         f"  1. 蛋白質目標不變\n"
         f"  2. 盡量安排在訓練日使用\n"
@@ -2304,19 +2416,17 @@ async def handle_today_summary(user_id: str) -> str:
     bar = build_progress_bar(totals["protein"], targets["protein"])
 
     is_cheat = db.is_cheat_day(user_id, today_str)
-    cal_target = targets["calories"] * 1.3 if is_cheat else targets["calories"]
-    remaining_cal = cal_target - totals["calories"]
-    if remaining_cal >= 0:
-        remaining_cal_line = f"剩餘熱量：約 {remaining_cal:.0f} kcal"
-    else:
-        remaining_cal_line = f"熱量狀態：已超過今日目標約 {-remaining_cal:.0f} kcal"
+    total_cal_line, remaining_cal_line = _format_daily_calorie_summary_lines(
+        user_id, today_str, totals,
+    )
+    cal_target = get_daily_calorie_target(user_id, today_str)
 
     lines = [
         f"今日飲食總結 ({today_str})",
         f"{'[欺騙日模式]' if is_cheat else ''}",
         "————",
         "",
-        f"總熱量：{totals['calories']:.0f}／{cal_target:.0f} kcal",
+        total_cal_line if is_cheat else f"總熱量：{totals['calories']:.0f}／{cal_target:.0f} kcal",
         remaining_cal_line,
         f"總蛋白質：{totals['protein']:.0f}／{targets['protein']:.0f} g",
         f"{bar}",
@@ -2436,7 +2546,8 @@ async def _build_jitai_nudge_message(
     profile = db.get_user_profile(user_id) or {}
     goal = _profile_fitness_goal(profile)
     remaining_pro = max(0.0, float(targets["protein"]) - float(totals["protein"]))
-    remaining_cal = float(targets["calories"]) - float(totals["calories"])
+    cal_target = get_daily_calorie_target(user_id, local_date_s)
+    remaining_cal = cal_target - float(totals["calories"])
 
     tz = _bot_timezone()
     now_local = datetime.now(timezone.utc).astimezone(tz)
@@ -2463,7 +2574,7 @@ async def _build_jitai_nudge_message(
         f"健身目標：{goal}\n"
         f"今日已攝取蛋白質：{totals['protein']:.0f} g／目標 {targets['protein']:.0f} g\n"
         f"尚缺蛋白質：約 {remaining_pro:.0f} g\n"
-        f"今日已攝取熱量：{totals['calories']:.0f} kcal／目標 {targets['calories']:.0f} kcal\n"
+        f"今日已攝取熱量：{totals['calories']:.0f} kcal／目標 {cal_target:.0f} kcal\n"
         f"熱量剩餘空間：約 {remaining_cal:.0f} kcal\n"
         f"距離今日窗格結束還有約 {mins_left} 分鐘\n"
         f"{urgency}\n\n"
@@ -2979,6 +3090,9 @@ HELP_TEXT = (
     "  「設定蛋白飲 熱量 蛋白質」：自訂快速記錄數值（例：設定蛋白飲 130 25）\n"
     "  「Notion狀態」：檢查目前是否會同步到 Notion\n"
     "  「我的ID」：顯示你的 LINE userId（可用於比對 NOTION_SYNC_USER_ID）\n"
+    "  「目標」「我的目標」：查看每日熱量／蛋白質目標\n"
+    "  「降低熱量」「降低熱量200」：在公式目標上再減少熱量（預設 150 kcal）\n"
+    "  「提高熱量」「重設熱量調整」：微調或還原個人熱量設定\n"
     "  「說明」：顯示此說明\n\n"
     "智能提醒 JITAI（預設關閉，需手動開啟）：\n"
     "  「開啟提醒」：僅進度落後時推送可執行補充建議\n"
@@ -3268,8 +3382,7 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
             leave_photo_wait_if_any(user_id)
             today_str = date.today().isoformat()
             db.activate_cheat_day(user_id, today_str)
-            targets = get_user_targets(user_id)
-            cheat_cal = targets["calories"] * 1.3
+            cheat_cal = get_daily_calorie_target(user_id, today_str)
             return (
                 f"欺騙日已強制啟動\n"
                 f"今日熱量上限：{cheat_cal:.0f} kcal\n\n"
@@ -3280,18 +3393,29 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
             leave_photo_wait_if_any(user_id)
             return await handle_ai_coach(user_id)
 
+        calorie_adj = parse_calorie_adjust(text)
+        if calorie_adj:
+            leave_photo_wait_if_any(user_id)
+            action, amount = calorie_adj
+            return await handle_calorie_adjust(user_id, action, amount)
+
         if text in ("目標", "我的目標", "查看目標"):
             leave_photo_wait_if_any(user_id)
             targets = get_user_targets(user_id)
             profile = db.get_user_profile(user_id)
             goal_label = _profile_fitness_goal(profile)
+            offset = int((profile or {}).get("calorie_offset") or 0)
             lines = [
                 "目前設定的目標",
                 "=" * 24,
                 f"健身目標：{goal_label}",
                 f"每日熱量：{targets['calories']:.0f} kcal",
-                f"每日蛋白質：{targets['protein']:.0f} g",
             ]
+            if profile and profile.get("weight") and offset:
+                base = _base_targets_from_profile(profile)["calories"]
+                sign = "+" if offset > 0 else ""
+                lines.append(f"  （公式 {base:.0f} {sign}{offset}）")
+            lines.append(f"每日蛋白質：{targets['protein']:.0f} g")
             if profile:
                 lines.extend([
                     "",

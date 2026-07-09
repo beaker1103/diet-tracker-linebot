@@ -439,6 +439,7 @@ class Database:
         self._migrate_user_profiles_tdee()
         self._migrate_user_profiles_onboarding()
         self._migrate_user_profiles_jitai()
+        self._migrate_user_profiles_calorie_offset()
         self._migrate_user_message_log_kind()
 
     def _migrate_user_profiles_tdee(self):
@@ -644,6 +645,7 @@ class Database:
         self._migrate_user_profiles_tdee()
         self._migrate_user_profiles_onboarding()
         self._migrate_user_profiles_jitai()
+        self._migrate_user_profiles_calorie_offset()
         self._migrate_user_message_log_kind()
 
     def _migrate_user_profiles_jitai(self):
@@ -667,6 +669,46 @@ class Database:
                 except sqlite3.OperationalError as e:
                     if "duplicate column" not in str(e).lower():
                         raise
+        finally:
+            conn.close()
+
+    def _migrate_user_profiles_calorie_offset(self):
+        """補上 calorie_offset（個人熱量微調，可為負值）。"""
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "ALTER TABLE user_profiles "
+                        "ADD COLUMN IF NOT EXISTS calorie_offset INTEGER DEFAULT 0"
+                    )
+                conn.commit()
+            else:
+                try:
+                    conn.execute(
+                        "ALTER TABLE user_profiles "
+                        "ADD COLUMN calorie_offset INTEGER DEFAULT 0"
+                    )
+                    conn.commit()
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+        finally:
+            conn.close()
+
+    def set_calorie_offset(self, user_id: str, offset: int):
+        now = datetime.now().isoformat()
+        sql = self._adapt(
+            "UPDATE user_profiles SET calorie_offset = ?, updated_at = ? WHERE user_id = ?"
+        )
+        conn = self._connect()
+        try:
+            if self._pg:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (int(offset), now, user_id))
+            else:
+                conn.execute(sql, (int(offset), now, user_id))
+            conn.commit()
         finally:
             conn.close()
 
