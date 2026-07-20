@@ -134,8 +134,30 @@ class UserState:
 # 記憶體內狀態 (生產環境可改用 Redis)
 _user_states: dict[str, str] = {}
 _user_contexts: dict[str, dict] = {}
-_pending_notes: dict[str, dict] = {}
+# user_id → message_id → 備註視窗（同使用者連傳多張照片時不得互相覆寫）
+_pending_notes: dict[str, dict[str, dict]] = {}
 _pending_notes_lock = asyncio.Lock()
+# 同使用者圖片分析串行；全域上限避免 Render 記憶體被兩張 Vision 同時打爆
+_user_analysis_locks: dict[str, asyncio.Lock] = {}
+_user_analysis_locks_guard = asyncio.Lock()
+_GLOBAL_IMAGE_ANALYSIS_LIMIT = max(1, int(os.getenv("IMAGE_ANALYSIS_CONCURRENCY", "2")))
+_global_image_analysis_sem: asyncio.Semaphore | None = None
+
+
+def _image_analysis_semaphore() -> asyncio.Semaphore:
+    global _global_image_analysis_sem
+    if _global_image_analysis_sem is None:
+        _global_image_analysis_sem = asyncio.Semaphore(_GLOBAL_IMAGE_ANALYSIS_LIMIT)
+    return _global_image_analysis_sem
+
+
+async def _user_analysis_lock(user_id: str) -> asyncio.Lock:
+    async with _user_analysis_locks_guard:
+        lock = _user_analysis_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _user_analysis_locks[user_id] = lock
+        return lock
 
 
 def set_state(user_id: str, state: str, context: dict | None = None):
@@ -289,7 +311,7 @@ def leave_photo_wait_if_any(user_id: str) -> None:
 
 
 def _photo_note_window_sec() -> float:
-    return float(os.getenv("PHOTO_NOTE_WINDOW_SEC", "10"))
+    return float(os.getenv("PHOTO_NOTE_WINDOW_SEC", "15"))
 
 
 def _extract_note_text(text: str) -> tuple[str | None, bool]:
@@ -316,20 +338,42 @@ _SCALE_SKIP_NAMES = frozenset({
 
 
 def _parse_total_weight_from_note(note: str) -> float | None:
-    """解析備註中的全餐一次秤重總熟重（公克）。"""
+    """解析備註中的全餐一次秤重總熟重（公克）。
+
+    支援「總重量：390g」「共 390g」「一共390克」等；避免把括號內品名誤當品項。
+    """
     if not (note or "").strip():
         return None
-    m = re.search(
+    patterns = (
         r"總(?:重量|重|共)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:g|克|公克)?",
-        note,
-        re.I,
+        r"(?:一共|總計|合計)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:g|克|公克)?",
+        r"(?:^|[\s、，,;；）)])共\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:g|克|公克)?",
     )
-    if not m:
-        return None
-    grams = float(m.group(1))
-    if grams <= 0 or grams > 5000:
-        return None
-    return grams
+    for pat in patterns:
+        m = re.search(pat, note, re.I)
+        if not m:
+            continue
+        grams = float(m.group(1))
+        if 0 < grams <= 5000:
+            return grams
+    return None
+
+
+def _strip_total_weight_phrases(note: str) -> str:
+    """移除總重語句，避免品項 regex 把「…蛋）共 390g」拆成假品名。"""
+    cleaned = re.sub(
+        r"(?:總(?:重量|重|共)|一共|總計|合計)\s*[:：]?\s*\d+(?:\.\d+)?\s*(?:g|克|公克)?",
+        " ",
+        note,
+        flags=re.I,
+    )
+    cleaned = re.sub(
+        r"(?:^|[\s、，,;；）)])共\s*[:：]?\s*\d+(?:\.\d+)?\s*(?:g|克|公克)?",
+        " ",
+        cleaned,
+        flags=re.I,
+    )
+    return cleaned
 
 
 def _parse_scale_weights_from_note(
@@ -338,17 +382,24 @@ def _parse_scale_weights_from_note(
     """從備註解析廚房秤實測克數，回傳 [{"name": "雞胸", "grams": 150.0}, ...]。"""
     if not (note or "").strip():
         return []
+    # 括號內列舉品名（無克數）不參與品項秤重解析
+    work = re.sub(r"[（(][^）)]*[）)]", " ", note)
+    work = _strip_total_weight_phrases(work)
     has_scale_hint = force_scale or any(kw in note for kw in _SCALE_NOTE_KEYWORDS)
-    has_unit_hint = bool(re.search(r"(?:\d\s*(?:g|克|公克)\b)", note, re.I))
 
     items: list[dict[str, str | float]] = []
     seen: set[str] = set()
 
     def _add(name: str, grams: float) -> None:
-        name = name.strip().strip("、，,;； ")
+        name = name.strip().strip("、，,;； ：:")
+        name = re.sub(r"^(?:加上|以及|還有|和|與|跟|再加)\s*", "", name)
         if not name or name in _SCALE_SKIP_NAMES:
             return
         if re.match(r"^總(?:重量|重|共)", name):
+            return
+        if "共" == name or name.endswith("共"):
+            return
+        if "）" in name or ")" in name or "（" in name or "(" in name:
             return
         if re.match(r"^[兩三四五六七八九十半\d]+[個片塊碗盤份杯]", name):
             return
@@ -361,18 +412,24 @@ def _parse_scale_weights_from_note(
         items.append({"name": name, "grams": grams})
 
     for m in re.finditer(
-        r"([^\d、,，;；\n\r]{1,24}?)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(g|克|公克)?",
-        note,
+        # 不用 \b：中文緊接「600g加上」時 g 與「加」皆屬 word char，\b 會讓第一段匹配失敗
+        r"([^\d、,，;；\n\r]{1,40}?)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(g|克|公克)(?![a-zA-Z])",
+        work,
         re.I,
     ):
-        name = m.group(1)
-        unit = (m.group(3) or "").strip()
-        grams = float(m.group(2))
-        if unit or has_scale_hint or has_unit_hint:
-            _add(name, grams)
+        _add(m.group(1), float(m.group(2)))
 
-    if not items and (has_scale_hint or "、" in note or "，" in note):
-        for part in re.split(r"[、,，]", note):
+    # 無顯式單位時：僅在秤重前綴／明確品名分隔下才接受「品名 數字」
+    if not items and (has_scale_hint or force_scale):
+        for m in re.finditer(
+            r"([^\d、,，;；\n\r]{1,24}?)\s*[:：]?\s*(\d+(?:\.\d+)?)\b",
+            work,
+            re.I,
+        ):
+            _add(m.group(1), float(m.group(2)))
+
+    if not items and (has_scale_hint or "、" in work or "，" in work):
+        for part in re.split(r"[、,，]", work):
             part = part.strip()
             if not part:
                 continue
@@ -448,12 +505,19 @@ def _build_meal_photo_note_prompt(
 
 
 async def create_pending_note_window(user_id: str, message_id: str, window_sec: float) -> None:
-    """建立此圖片的備註等待視窗。"""
+    """建立此圖片的備註等待視窗（以 message_id 區隔，連傳多張不會互相覆寫）。"""
     expire_at = datetime.now(timezone.utc) + timedelta(seconds=window_sec)
     async with _pending_notes_lock:
-        _pending_notes[user_id] = {
+        slots = _pending_notes.setdefault(user_id, {})
+        # 清掉已過期的舊視窗，避免記憶體累積
+        now = datetime.now(timezone.utc)
+        expired = [mid for mid, s in slots.items() if now > s["expire_at"]]
+        for mid in expired:
+            slots.pop(mid, None)
+        slots[message_id] = {
             "message_id": message_id,
             "expire_at": expire_at,
+            "created_at": now,
             "note": "",
             "force_scale": False,
             "event": asyncio.Event(),
@@ -463,16 +527,24 @@ async def create_pending_note_window(user_id: str, message_id: str, window_sec: 
 async def add_pending_note_if_open(
     user_id: str, note: str, *, force_scale: bool = False,
 ) -> tuple[bool, str]:
-    """若仍在等待視窗內，將備註綁到最近一張圖片。"""
+    """若仍在等待視窗內，將備註綁到「最近一張」仍有效的圖片。"""
     now = datetime.now(timezone.utc)
     async with _pending_notes_lock:
-        item = _pending_notes.get(user_id)
-        if not item:
-            return False, "目前沒有可附加備註的待分析照片。請先上傳照片。"
-        if now > item["expire_at"]:
+        slots = _pending_notes.get(user_id) or {}
+        # 丟掉過期
+        alive = {
+            mid: s for mid, s in slots.items()
+            if now <= s["expire_at"]
+        }
+        if not alive:
             _pending_notes.pop(user_id, None)
-            sec = int(_photo_note_window_sec())
-            return False, f"這張照片的備註視窗已超過 {sec} 秒，請重新上傳照片後再補備註。"
+            if slots:
+                sec = int(_photo_note_window_sec())
+                return False, f"這張照片的備註視窗已超過 {sec} 秒，請重新上傳照片後再補備註。"
+            return False, "目前沒有可附加備註的待分析照片。請先上傳照片。"
+        _pending_notes[user_id] = alive
+        # 綁到最近建立的視窗（使用者通常對「剛傳的那張」補備註）
+        item = max(alive.values(), key=lambda s: s.get("created_at") or s["expire_at"])
         item["note"] = note
         item["force_scale"] = force_scale
         ev = item.get("event")
@@ -486,8 +558,9 @@ async def wait_and_take_pending_note(
 ) -> tuple[str, bool]:
     """等待最多 window_sec 秒接收備註，回傳 (備註內容, 是否為秤重前綴)。"""
     async with _pending_notes_lock:
-        item = _pending_notes.get(user_id)
-        if not item or item.get("message_id") != message_id:
+        slots = _pending_notes.get(user_id) or {}
+        item = slots.get(message_id)
+        if not item:
             return "", False
         expire_at = item["expire_at"]
         ev = item.get("event")
@@ -499,12 +572,14 @@ async def wait_and_take_pending_note(
         except asyncio.TimeoutError:
             pass
     async with _pending_notes_lock:
-        latest = _pending_notes.get(user_id)
-        if not latest or latest.get("message_id") != message_id:
+        slots = _pending_notes.get(user_id) or {}
+        latest = slots.pop(message_id, None)
+        if not slots:
+            _pending_notes.pop(user_id, None)
+        if not latest:
             return "", False
         note = str(latest.get("note") or "").strip()
         force_scale = bool(latest.get("force_scale"))
-        _pending_notes.pop(user_id, None)
         return note, force_scale
 
 
@@ -3008,66 +3083,89 @@ async def _analyze_image_by_state(
 
 
 async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_receive: str):
-    """背景執行：下載、壓縮、Vision、寫入 DB，完成後 push 結果。"""
+    """背景執行：下載、壓縮、Vision、寫入 DB，完成後 push 結果。
+
+    備註視窗先獨立等待（不佔分析鎖），再以同使用者串行 + 全域並發上限執行重負載分析，
+    避免連傳兩張時互搶狀態或把進程打掛。
+    """
     timeout_sec = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "180"))
     note_wait_sec = _photo_note_window_sec()
     analyze_timeout = max(60.0, timeout_sec - note_wait_sec)
     body = ""
-    logger.info(
-        "圖片分析開始 user=%s msg=%s state=%s total=%.0fs analyze=%.0fs",
-        user_id[:8],
-        message_id,
-        state_at_receive,
-        timeout_sec,
-        analyze_timeout,
-    )
-    try:
-        user_note = ""
-        force_scale = False
-        skip_note = state_at_receive in (
-            UserState.WAITING_PURCHASE_PHOTO,
-            UserState.WAITING_INBODY_PHOTO,
-            UserState.ONBOARDING_WAITING_GOAL,
-        ) or db.needs_inbody(user_id)
-        if not skip_note:
-            user_note, force_scale = await wait_and_take_pending_note(
-                user_id, message_id, note_wait_sec,
+    user_note = ""
+    force_scale = False
+
+    skip_note = state_at_receive in (
+        UserState.WAITING_PURCHASE_PHOTO,
+        UserState.WAITING_INBODY_PHOTO,
+        UserState.ONBOARDING_WAITING_GOAL,
+    ) or db.needs_inbody(user_id)
+    if not skip_note:
+        # 必須在排隊分析前完成，否則佇列等待會讓備註視窗過期
+        user_note, force_scale = await wait_and_take_pending_note(
+            user_id, message_id, note_wait_sec,
+        )
+        if user_note:
+            logger.info("圖片分析附加使用者備註 user=%s msg=%s", user_id[:8], message_id)
+
+    user_lock = await _user_analysis_lock(user_id)
+    async with user_lock:
+        async with _image_analysis_semaphore():
+            logger.info(
+                "圖片分析開始 user=%s msg=%s state=%s analyze=%.0fs queued_note=%s",
+                user_id[:8],
+                message_id,
+                state_at_receive,
+                analyze_timeout,
+                bool(user_note),
             )
-            if user_note:
-                logger.info("圖片分析附加使用者備註 user=%s msg=%s", user_id[:8], message_id)
-        body = await asyncio.wait_for(
-            _analyze_image_by_state(
-                user_id, message_id, state_at_receive,
-                user_note=user_note, force_scale=force_scale,
-            ),
-            timeout=analyze_timeout,
-        )
-        logger.info("圖片分析完成 user=%s msg=%s", user_id[:8], message_id)
-    except asyncio.TimeoutError:
-        logger.error("圖片分析逾時 user=%s msg=%s", user_id[:8], message_id)
-        body = (
-            "本次圖片分析耗時過長，已自動中止。\n"
-            "請重新傳一次照片（盡量清晰、只拍重點），我會立即重跑。"
-        )
-    except asyncio.CancelledError:
-        logger.error("圖片分析任務被取消 user=%s msg=%s", user_id[:8], message_id)
-        if not body.strip():
-            body = "分析尚未完成（可能因服務重啟），請重新傳送照片。"
-        raise
-    except UserFacingError as e:
-        logger.warning("圖片分析可恢復錯誤 user=%s msg=%s err=%s", user_id[:8], message_id, e)
-        body = str(e)
-    except Exception as e:
-        logger.error("背景圖片分析失敗: %s", e, exc_info=True)
-        body = "分析過程發生錯誤，請稍後再試或重新傳送照片。"
-    finally:
-        if not (body or "").strip():
-            body = "分析完成但未產生結果，請重新傳送照片。"
-        try:
-            await push_line_text_with_retry(user_id, body, attempts=3)
-            logger.info("圖片分析結果已推送 user=%s msg=%s", user_id[:8], message_id)
-        except Exception as e:
-            logger.error("Push 分析結果失敗 user=%s msg=%s: %s", user_id[:8], message_id, e, exc_info=True)
+            try:
+                body = await asyncio.wait_for(
+                    _analyze_image_by_state(
+                        user_id, message_id, state_at_receive,
+                        user_note=user_note, force_scale=force_scale,
+                    ),
+                    timeout=analyze_timeout,
+                )
+                logger.info("圖片分析完成 user=%s msg=%s", user_id[:8], message_id)
+            except asyncio.TimeoutError:
+                logger.error("圖片分析逾時 user=%s msg=%s", user_id[:8], message_id)
+                body = (
+                    "本次圖片分析耗時過長，已自動中止。\n"
+                    "請重新傳一次照片（盡量清晰、只拍重點），我會立即重跑。"
+                )
+            except asyncio.CancelledError:
+                logger.error("圖片分析任務被取消 user=%s msg=%s", user_id[:8], message_id)
+                if not body.strip():
+                    body = "分析尚未完成（可能因服務重啟），請重新傳送照片。"
+                try:
+                    await push_line_text_with_retry(user_id, body, attempts=2)
+                except Exception as push_err:
+                    logger.error(
+                        "取消後 Push 失敗 user=%s msg=%s: %s",
+                        user_id[:8], message_id, push_err,
+                    )
+                raise
+            except UserFacingError as e:
+                logger.warning(
+                    "圖片分析可恢復錯誤 user=%s msg=%s err=%s",
+                    user_id[:8], message_id, e,
+                )
+                body = str(e)
+            except Exception as e:
+                logger.error("背景圖片分析失敗: %s", e, exc_info=True)
+                body = "分析過程發生錯誤，請稍後再試或重新傳送照片。"
+
+            if not (body or "").strip():
+                body = "分析完成但未產生結果，請重新傳送照片。"
+            try:
+                await push_line_text_with_retry(user_id, body, attempts=3)
+                logger.info("圖片分析結果已推送 user=%s msg=%s", user_id[:8], message_id)
+            except Exception as e:
+                logger.error(
+                    "Push 分析結果失敗 user=%s msg=%s: %s",
+                    user_id[:8], message_id, e, exc_info=True,
+                )
 
 
 HELP_TEXT = (
@@ -3078,7 +3176,7 @@ HELP_TEXT = (
     "基本操作：\n"
     "  拍照傳食物，將自動分析並記錄（熱量為減脂保守估計）。\n"
     "  文字報餐：以「記錄」「記一筆」或「吃」開頭＋描述（例：記錄 雞腿飯半個＋燙青菜）。\n\n"
-    "  傳完照片後 10 秒內可補備註／備注，例如：\n"
+    "  傳完照片後 15 秒內可補備註／備注，例如：\n"
     "    備註：這是雞胸肉不是豬排\n"
     "    秤重：雞胸150g、米飯180g、總重量：450g\n"
     "    備注：炸雞、高麗菜、泡麵，總重量：520g（僅一次秤重時寫總重量）\n"
@@ -3179,6 +3277,20 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                         UserState.ONBOARDING_WAITING_GOAL,
                     ) or db.needs_inbody(user_id):
                         reply_text = "已收到 InBody 照片，正在分析中…"
+                    user_lock = _user_analysis_locks.get(user_id)
+                    if (
+                        user_lock is not None
+                        and user_lock.locked()
+                        and snap_state not in (
+                            UserState.WAITING_PURCHASE_PHOTO,
+                            UserState.WAITING_INBODY_PHOTO,
+                        )
+                        and not db.needs_inbody(user_id)
+                    ):
+                        reply_text = (
+                            "已收到照片，已排入分析佇列"
+                            "（前一張仍在處理，完成後會依序回覆）。"
+                        )
                     if snap_state not in (
                         UserState.WAITING_PURCHASE_PHOTO,
                         UserState.WAITING_INBODY_PHOTO,
