@@ -142,6 +142,9 @@ _user_analysis_locks: dict[str, asyncio.Lock] = {}
 _user_analysis_locks_guard = asyncio.Lock()
 _GLOBAL_IMAGE_ANALYSIS_LIMIT = max(1, int(os.getenv("IMAGE_ANALYSIS_CONCURRENCY", "2")))
 _global_image_analysis_sem: asyncio.Semaphore | None = None
+# 以 create_task 跑長任務，並強引用避免被 GC；不綁在 webhook BackgroundTasks 上
+# （Render 上 BackgroundTasks 偶發在回應後未跑完就被中斷）
+_background_jobs: set[asyncio.Task] = set()
 
 
 def _image_analysis_semaphore() -> asyncio.Semaphore:
@@ -158,6 +161,24 @@ async def _user_analysis_lock(user_id: str) -> asyncio.Lock:
             lock = asyncio.Lock()
             _user_analysis_locks[user_id] = lock
         return lock
+
+
+def spawn_background_job(coro) -> asyncio.Task:
+    """啟動與 webhook 請求生命週期無關的背景任務。"""
+    task = asyncio.create_task(coro)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_jobs.discard(t)
+        if t.cancelled():
+            logger.warning("背景任務被取消")
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error("背景任務未捕捉例外: %s", exc, exc_info=exc)
+
+    _background_jobs.add(task)
+    task.add_done_callback(_on_done)
+    return task
 
 
 def set_state(user_id: str, state: str, context: dict | None = None):
@@ -717,8 +738,8 @@ async def call_openai_vision(
     if response_json_object:
         payload["response_format"] = {"type": "json_object"}
 
-    timeout_sec = float(os.getenv("OPENAI_TIMEOUT_SEC", "90"))
-    max_retries = max(1, int(os.getenv("OPENAI_MAX_RETRIES", "3")))
+    timeout_sec = float(os.getenv("OPENAI_TIMEOUT_SEC", "60"))
+    max_retries = max(1, int(os.getenv("OPENAI_MAX_RETRIES", "2")))
     timeout = httpx.Timeout(timeout_sec, connect=20.0)
 
     resp: httpx.Response | None = None
@@ -938,7 +959,7 @@ async def download_line_image_bytes(message_id: str) -> bytes:
     raise UserFacingError("目前無法取得圖片，請重新傳送照片。")
 
 
-def compress_image_bytes_to_jpeg_base64(data: bytes, max_side: int = 1280, quality: int = 80) -> str:
+def compress_image_bytes_to_jpeg_base64(data: bytes, max_side: int = 1024, quality: int = 72) -> str:
     """將圖片壓成 JPEG 再 base64，降低 Vision 請求體積。失敗時退回原始 base64。"""
     try:
         from PIL import Image
@@ -1684,7 +1705,7 @@ async def handle_meal_photo(
             f"{note_prompt}"
         ),
         image_base64=image_b64,
-        image_detail="high",
+        image_detail="auto",
     )
 
     if isinstance(result, OpenAIUserNotice):
@@ -3085,87 +3106,134 @@ async def _analyze_image_by_state(
 async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_receive: str):
     """背景執行：下載、壓縮、Vision、寫入 DB，完成後 push 結果。
 
-    備註視窗先獨立等待（不佔分析鎖），再以同使用者串行 + 全域並發上限執行重負載分析，
-    避免連傳兩張時互搶狀態或把進程打掛。
+    備註視窗先獨立等待（不佔分析鎖），再以同使用者串行 + 全域並發上限執行重負載分析。
+    取得使用者鎖設逾時，避免前一張卡住導致後續永遠無回覆。
     """
-    timeout_sec = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "180"))
+    # 備註等待已在鎖外完成，此逾時只涵蓋下載＋Vision＋寫入
+    analyze_timeout = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "150"))
     note_wait_sec = _photo_note_window_sec()
-    analyze_timeout = max(60.0, timeout_sec - note_wait_sec)
+    lock_wait_sec = float(os.getenv("IMAGE_ANALYSIS_LOCK_WAIT_SEC", "90"))
     body = ""
     user_note = ""
     force_scale = False
+    pushed = False
 
-    skip_note = state_at_receive in (
-        UserState.WAITING_PURCHASE_PHOTO,
-        UserState.WAITING_INBODY_PHOTO,
-        UserState.ONBOARDING_WAITING_GOAL,
-    ) or db.needs_inbody(user_id)
-    if not skip_note:
-        # 必須在排隊分析前完成，否則佇列等待會讓備註視窗過期
-        user_note, force_scale = await wait_and_take_pending_note(
-            user_id, message_id, note_wait_sec,
+    async def _safe_push(text: str, *, attempts: int = 3) -> None:
+        nonlocal pushed
+        if not (text or "").strip():
+            return
+        await push_line_text_with_retry(user_id, text, attempts=attempts)
+        pushed = True
+
+    try:
+        skip_note = state_at_receive in (
+            UserState.WAITING_PURCHASE_PHOTO,
+            UserState.WAITING_INBODY_PHOTO,
+            UserState.ONBOARDING_WAITING_GOAL,
         )
-        if user_note:
-            logger.info("圖片分析附加使用者備註 user=%s msg=%s", user_id[:8], message_id)
+        if not skip_note:
+            # 同步 DB 可能阻塞事件迴圈；放到 thread
+            needs_inbody = await asyncio.to_thread(db.needs_inbody, user_id)
+            skip_note = needs_inbody
 
-    user_lock = await _user_analysis_lock(user_id)
-    async with user_lock:
-        async with _image_analysis_semaphore():
-            logger.info(
-                "圖片分析開始 user=%s msg=%s state=%s analyze=%.0fs queued_note=%s",
-                user_id[:8],
-                message_id,
-                state_at_receive,
-                analyze_timeout,
-                bool(user_note),
+        if not skip_note:
+            user_note, force_scale = await wait_and_take_pending_note(
+                user_id, message_id, note_wait_sec,
             )
-            try:
-                body = await asyncio.wait_for(
-                    _analyze_image_by_state(
-                        user_id, message_id, state_at_receive,
-                        user_note=user_note, force_scale=force_scale,
-                    ),
-                    timeout=analyze_timeout,
-                )
-                logger.info("圖片分析完成 user=%s msg=%s", user_id[:8], message_id)
-            except asyncio.TimeoutError:
-                logger.error("圖片分析逾時 user=%s msg=%s", user_id[:8], message_id)
-                body = (
-                    "本次圖片分析耗時過長，已自動中止。\n"
-                    "請重新傳一次照片（盡量清晰、只拍重點），我會立即重跑。"
-                )
-            except asyncio.CancelledError:
-                logger.error("圖片分析任務被取消 user=%s msg=%s", user_id[:8], message_id)
-                if not body.strip():
-                    body = "分析尚未完成（可能因服務重啟），請重新傳送照片。"
+            if user_note:
+                logger.info("圖片分析附加使用者備註 user=%s msg=%s", user_id[:8], message_id)
                 try:
-                    await push_line_text_with_retry(user_id, body, attempts=2)
-                except Exception as push_err:
-                    logger.error(
-                        "取消後 Push 失敗 user=%s msg=%s: %s",
-                        user_id[:8], message_id, push_err,
-                    )
-                raise
-            except UserFacingError as e:
-                logger.warning(
-                    "圖片分析可恢復錯誤 user=%s msg=%s err=%s",
-                    user_id[:8], message_id, e,
-                )
-                body = str(e)
-            except Exception as e:
-                logger.error("背景圖片分析失敗: %s", e, exc_info=True)
-                body = "分析過程發生錯誤，請稍後再試或重新傳送照片。"
+                    await _safe_push("備註已套用，開始分析照片…", attempts=2)
+                except Exception as e:
+                    logger.warning("進度推播失敗（繼續分析）: %s", e)
 
-            if not (body or "").strip():
-                body = "分析完成但未產生結果，請重新傳送照片。"
-            try:
-                await push_line_text_with_retry(user_id, body, attempts=3)
-                logger.info("圖片分析結果已推送 user=%s msg=%s", user_id[:8], message_id)
-            except Exception as e:
-                logger.error(
-                    "Push 分析結果失敗 user=%s msg=%s: %s",
-                    user_id[:8], message_id, e, exc_info=True,
+        user_lock = await _user_analysis_lock(user_id)
+        try:
+            await asyncio.wait_for(user_lock.acquire(), timeout=lock_wait_sec)
+        except asyncio.TimeoutError:
+            logger.error(
+                "取得分析鎖逾時 user=%s msg=%s wait=%.0fs",
+                user_id[:8], message_id, lock_wait_sec,
+            )
+            await _safe_push(
+                "目前仍有前一張照片在分析，這次排程等待過久已中止。\n"
+                "請稍候再傳一次照片（一次一張較穩定）。"
+            )
+            return
+
+        try:
+            async with _image_analysis_semaphore():
+                logger.info(
+                    "圖片分析開始 user=%s msg=%s state=%s analyze=%.0fs has_note=%s",
+                    user_id[:8],
+                    message_id,
+                    state_at_receive,
+                    analyze_timeout,
+                    bool(user_note),
                 )
+                try:
+                    body = await asyncio.wait_for(
+                        _analyze_image_by_state(
+                            user_id, message_id, state_at_receive,
+                            user_note=user_note, force_scale=force_scale,
+                        ),
+                        timeout=analyze_timeout,
+                    )
+                    logger.info("圖片分析完成 user=%s msg=%s", user_id[:8], message_id)
+                except asyncio.TimeoutError:
+                    logger.error("圖片分析逾時 user=%s msg=%s", user_id[:8], message_id)
+                    body = (
+                        "本次圖片分析耗時過長，已自動中止。\n"
+                        "請重新傳一次照片（盡量清晰、只拍重點），我會立即重跑。"
+                    )
+                except asyncio.CancelledError:
+                    logger.error("圖片分析任務被取消 user=%s msg=%s", user_id[:8], message_id)
+                    body = "分析尚未完成（可能因服務重啟），請重新傳送照片。"
+                    try:
+                        await _safe_push(body, attempts=2)
+                    except Exception as push_err:
+                        logger.error(
+                            "取消後 Push 失敗 user=%s msg=%s: %s",
+                            user_id[:8], message_id, push_err,
+                        )
+                    raise
+                except UserFacingError as e:
+                    logger.warning(
+                        "圖片分析可恢復錯誤 user=%s msg=%s err=%s",
+                        user_id[:8], message_id, e,
+                    )
+                    body = str(e)
+                except Exception as e:
+                    logger.error("背景圖片分析失敗: %s", e, exc_info=True)
+                    body = "分析過程發生錯誤，請稍後再試或重新傳送照片。"
+
+                if not (body or "").strip():
+                    body = "分析完成但未產生結果，請重新傳送照片。"
+                try:
+                    await _safe_push(body, attempts=3)
+                    logger.info("圖片分析結果已推送 user=%s msg=%s", user_id[:8], message_id)
+                except Exception as e:
+                    logger.error(
+                        "Push 分析結果失敗 user=%s msg=%s: %s",
+                        user_id[:8], message_id, e, exc_info=True,
+                    )
+        finally:
+            user_lock.release()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(
+            "圖片分析外層失敗 user=%s msg=%s: %s",
+            user_id[:8], message_id, e, exc_info=True,
+        )
+        if not pushed:
+            try:
+                await _safe_push(
+                    "分析過程發生錯誤，請稍後再試或重新傳送照片。",
+                    attempts=2,
+                )
+            except Exception:
+                logger.error("外層錯誤推播亦失敗 user=%s", user_id[:8], exc_info=True)
 
 
 HELP_TEXT = (
@@ -3298,11 +3366,13 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                         await create_pending_note_window(
                             user_id, event.message.id, window_sec=_photo_note_window_sec(),
                         )
-                    background_tasks.add_task(
-                        run_image_analysis_and_push,
-                        user_id,
-                        event.message.id,
-                        snap_state,
+                    # 用獨立 Task，不依賴 BackgroundTasks（長分析才穩）
+                    spawn_background_job(
+                        run_image_analysis_and_push(
+                            user_id,
+                            event.message.id,
+                            snap_state,
+                        )
                     )
                 else:
                     reply_text = await route_message(event, user_id, state)
