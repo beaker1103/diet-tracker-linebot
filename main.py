@@ -3092,6 +3092,11 @@ async def push_line_text(user_id: str, text: str):
         return
     except Exception as e:
         last_err = e
+        err_s = str(e)
+        # 429 月額度／限流時 SDK 與 httpx 都會失敗，不必再打一次白耗
+        if "429" in err_s or "Too Many Requests" in err_s:
+            logger.error("LINE push 遭 429（多半是本月訊息額度用完）user=%s: %s", user_id[:8], e)
+            raise
         logger.warning("LINE SDK push 失敗，改試 httpx: %s", e)
 
     timeout = httpx.Timeout(20.0, connect=10.0)
@@ -3218,13 +3223,15 @@ async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_re
                 await _safe_push("無法取得照片，請重新傳送一次。")
                 return
 
-        try:
-            await _safe_push(
-                "備註已套用，開始分析照片…" if user_note else "開始分析照片…",
-                attempts=2,
-            )
-        except Exception as e:
-            logger.warning("進度推播失敗（繼續分析）: %s", e)
+        # 進度推播預設關閉：免費方案每月僅 200 則，多推一次就多耗額度
+        if os.getenv("PHOTO_PROGRESS_PUSH", "").strip().lower() in ("1", "true", "yes"):
+            try:
+                await _safe_push(
+                    "備註已套用，開始分析照片…" if user_note else "開始分析照片…",
+                    attempts=2,
+                )
+            except Exception as e:
+                logger.warning("進度推播失敗（繼續分析）: %s", e)
 
         user_lock = await _user_analysis_lock(user_id)
         try:
@@ -3576,9 +3583,18 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
                 return "Reply 正常。Push 測試也已送出；若你有收到上一則「推播測試成功」，代表分析結果推播通道正常。"
             except Exception as e:
                 logger.error("測試推播失敗 user=%s: %s", user_id[:8], e, exc_info=True)
+                err = str(e)
+                quota_hint = ""
+                if "429" in err or "Too Many Requests" in err:
+                    quota_hint = (
+                        "\n\n這通常是 LINE 免費方案本月訊息額度用完（常見 200/200），"
+                        "不是 Bot 程式壞掉。請到 LINE Official Account Manager 看「訊息用量」，"
+                        "下個月重置後會恢復，或升級／加購訊息方案。"
+                    )
                 return (
                     "Reply 正常，但 Push 失敗（餐點分析結果走 Push，所以會收不到）。\n"
                     f"錯誤：{type(e).__name__}: {e}"
+                    f"{quota_hint}"
                 )
 
         if text in ("Notion狀態", "notion狀態", "Notion 狀態", "notion status", "Notion status"):
