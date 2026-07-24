@@ -331,6 +331,19 @@ def leave_photo_wait_if_any(user_id: str) -> None:
         clear_state(user_id)
 
 
+async def release_pending_note_waits(user_id: str) -> None:
+    """使用者改做其他事（如加蛋白飲）時，結束備註等待、立刻開始分析。"""
+    async with _pending_notes_lock:
+        slots = _pending_notes.get(user_id) or {}
+        for item in slots.values():
+            if str(item.get("note") or "").strip():
+                continue
+            item["skip_wait"] = True
+            ev = item.get("event")
+            if isinstance(ev, asyncio.Event):
+                ev.set()
+
+
 def _photo_note_window_sec() -> float:
     return float(os.getenv("PHOTO_NOTE_WINDOW_SEC", "15"))
 
@@ -601,6 +614,8 @@ async def wait_and_take_pending_note(
             return "", False
         note = str(latest.get("note") or "").strip()
         force_scale = bool(latest.get("force_scale"))
+        if latest.get("skip_wait") and not note:
+            return "", False
         return note, force_scale
 
 
@@ -1688,10 +1703,16 @@ def handle_set_quick_item(user_id: str, text: str) -> str:
 
 
 async def handle_meal_photo(
-    user_id: str, message_id: str, user_note: str = "", *, force_scale: bool = False,
+    user_id: str,
+    message_id: str,
+    user_note: str = "",
+    *,
+    force_scale: bool = False,
+    image_b64: str | None = None,
 ) -> str:
     """處理食物照片：分析＋記錄＋回傳摘要。"""
-    image_b64 = await get_line_image_base64(message_id)
+    if not image_b64:
+        image_b64 = await get_line_image_base64(message_id)
     note_prompt, scale_weights, total_weight_g = _build_meal_photo_note_prompt(
         user_note, force_scale=force_scale,
     )
@@ -3055,14 +3076,47 @@ def truncate_line_text(text: str) -> str:
 
 
 async def push_line_text(user_id: str, text: str):
-    """以 Push API 傳送文字（用於圖片分析完成後，不依賴 reply_token）。"""
+    """以 Push API 傳送文字（用於圖片分析完成後，不依賴 reply_token）。
+
+    先試 LINE SDK；失敗則改用 httpx 直打 REST，並把錯誤本文寫入 log。
+    """
     text = truncate_line_text(text)
-    cfg = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-    async with AsyncApiClient(cfg) as api_client:
-        api = AsyncMessagingApi(api_client)
-        await api.push_message(
-            PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
+    last_err: Exception | None = None
+    try:
+        cfg = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
+        async with AsyncApiClient(cfg) as api_client:
+            api = AsyncMessagingApi(api_client)
+            await api.push_message(
+                PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
+            )
+        return
+    except Exception as e:
+        last_err = e
+        logger.warning("LINE SDK push 失敗，改試 httpx: %s", e)
+
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            "https://api.line.me/v2/bot/message/push",
+            headers={
+                "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "to": user_id,
+                "messages": [{"type": "text", "text": text}],
+            },
         )
+    if resp.status_code >= 400:
+        logger.error(
+            "httpx push 失敗 HTTP %s user=%s body=%s",
+            resp.status_code,
+            user_id[:8],
+            (resp.text or "")[:500],
+        )
+        resp.raise_for_status()
+    if last_err:
+        logger.info("httpx push 備援成功 user=%s", user_id[:8])
 
 
 async def push_line_text_with_retry(user_id: str, text: str, attempts: int = 3):
@@ -3086,6 +3140,7 @@ async def _analyze_image_by_state(
     state_at_receive: str,
     user_note: str = "",
     force_scale: bool = False,
+    image_b64: str | None = None,
 ) -> str:
     if state_at_receive == UserState.WAITING_PURCHASE_PHOTO:
         return await handle_purchase_query_photo(user_id, message_id)
@@ -3094,22 +3149,25 @@ async def _analyze_image_by_state(
         UserState.ONBOARDING_WAITING_GOAL,
     ):
         return await handle_inbody_photo(user_id, message_id)
-    if db.needs_inbody(user_id):
+    if await asyncio.to_thread(db.needs_inbody, user_id):
         return await handle_inbody_photo(user_id, message_id)
-    if not db.is_onboarded(user_id):
+    if not await asyncio.to_thread(db.is_onboarded, user_id):
         return ONBOARDING_BLOCKED_TEXT
     return await handle_meal_photo(
-        user_id, message_id, user_note=user_note, force_scale=force_scale,
+        user_id,
+        message_id,
+        user_note=user_note,
+        force_scale=force_scale,
+        image_b64=image_b64,
     )
 
 
 async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_receive: str):
     """背景執行：下載、壓縮、Vision、寫入 DB，完成後 push 結果。
 
-    備註視窗先獨立等待（不佔分析鎖），再以同使用者串行 + 全域並發上限執行重負載分析。
-    取得使用者鎖設逾時，避免前一張卡住導致後續永遠無回覆。
+    圖片下載與備註等待並行；其他指令可提早結束備註等待。
+    分析結果一律走 Push（reply_token 已在「分析中」用掉）。
     """
-    # 備註等待已在鎖外完成，此逾時只涵蓋下載＋Vision＋寫入
     analyze_timeout = float(os.getenv("IMAGE_ANALYSIS_TIMEOUT_SEC", "150"))
     note_wait_sec = _photo_note_window_sec()
     lock_wait_sec = float(os.getenv("IMAGE_ANALYSIS_LOCK_WAIT_SEC", "90"))
@@ -3117,6 +3175,7 @@ async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_re
     user_note = ""
     force_scale = False
     pushed = False
+    image_b64: str | None = None
 
     async def _safe_push(text: str, *, attempts: int = 3) -> None:
         nonlocal pushed
@@ -3132,20 +3191,40 @@ async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_re
             UserState.ONBOARDING_WAITING_GOAL,
         )
         if not skip_note:
-            # 同步 DB 可能阻塞事件迴圈；放到 thread
             needs_inbody = await asyncio.to_thread(db.needs_inbody, user_id)
             skip_note = needs_inbody
 
+        # 餐點照：下載與備註等待並行，避免空等 15 秒後才抓圖
+        download_task: asyncio.Task | None = None
         if not skip_note:
+            download_task = asyncio.create_task(get_line_image_base64(message_id))
             user_note, force_scale = await wait_and_take_pending_note(
                 user_id, message_id, note_wait_sec,
             )
             if user_note:
                 logger.info("圖片分析附加使用者備註 user=%s msg=%s", user_id[:8], message_id)
-                try:
-                    await _safe_push("備註已套用，開始分析照片…", attempts=2)
-                except Exception as e:
-                    logger.warning("進度推播失敗（繼續分析）: %s", e)
+
+        if download_task is not None:
+            try:
+                image_b64 = await download_task
+            except UserFacingError as e:
+                await _safe_push(str(e))
+                return
+            except Exception as e:
+                logger.error(
+                    "圖片下載失敗 user=%s msg=%s: %s",
+                    user_id[:8], message_id, e, exc_info=True,
+                )
+                await _safe_push("無法取得照片，請重新傳送一次。")
+                return
+
+        try:
+            await _safe_push(
+                "備註已套用，開始分析照片…" if user_note else "開始分析照片…",
+                attempts=2,
+            )
+        except Exception as e:
+            logger.warning("進度推播失敗（繼續分析）: %s", e)
 
         user_lock = await _user_analysis_lock(user_id)
         try:
@@ -3164,22 +3243,27 @@ async def run_image_analysis_and_push(user_id: str, message_id: str, state_at_re
         try:
             async with _image_analysis_semaphore():
                 logger.info(
-                    "圖片分析開始 user=%s msg=%s state=%s analyze=%.0fs has_note=%s",
+                    "圖片分析開始 user=%s msg=%s state=%s analyze=%.0fs has_note=%s has_img=%s",
                     user_id[:8],
                     message_id,
                     state_at_receive,
                     analyze_timeout,
                     bool(user_note),
+                    bool(image_b64),
                 )
                 try:
                     body = await asyncio.wait_for(
                         _analyze_image_by_state(
                             user_id, message_id, state_at_receive,
                             user_note=user_note, force_scale=force_scale,
+                            image_b64=image_b64,
                         ),
                         timeout=analyze_timeout,
                     )
-                    logger.info("圖片分析完成 user=%s msg=%s", user_id[:8], message_id)
+                    logger.info(
+                        "圖片分析完成 user=%s msg=%s chars=%s",
+                        user_id[:8], message_id, len(body or ""),
+                    )
                 except asyncio.TimeoutError:
                     logger.error("圖片分析逾時 user=%s msg=%s", user_id[:8], message_id)
                     body = (
@@ -3256,6 +3340,7 @@ HELP_TEXT = (
     "  「設定蛋白飲 熱量 蛋白質」：自訂快速記錄數值（例：設定蛋白飲 130 25）\n"
     "  「Notion狀態」：檢查目前是否會同步到 Notion\n"
     "  「我的ID」：顯示你的 LINE userId（可用於比對 NOTION_SYNC_USER_ID）\n"
+    "  「測試推播」：檢查 Push API 是否正常（診斷分析結果收不到）\n"
     "  「目標」「我的目標」：查看每日熱量／蛋白質目標\n"
     "  「降低熱量」「降低熱量200」：在公式目標上再減少熱量（預設 150 kcal）\n"
     "  「提高熱量」「重設熱量調整」：微調或還原個人熱量設定\n"
@@ -3413,11 +3498,13 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
         text = event.message.text.replace("\u3000", " ").strip()
         note_text, is_scale_prefix = _extract_note_text(text)
         if note_text is not None:
-            ok, msg = await add_pending_note_if_open(
+            _ok, msg = await add_pending_note_if_open(
                 user_id, note_text, force_scale=is_scale_prefix,
             )
-            if ok:
-                return msg
+            return msg
+
+        # 非備註指令（如加蛋白飲）：結束備註等待，讓照片分析立刻開始
+        await release_pending_note_waits(user_id)
 
         onboarding_allowed = {
             "說明", "幫助", "help", "Help", "HELP",
@@ -3481,6 +3568,18 @@ async def route_message(event: MessageEvent, user_id: str, state: str) -> str:
         if text in ("我的ID", "我的id", "my id", "My ID", "userid", "user id"):
             leave_photo_wait_if_any(user_id)
             return f"你的 LINE userId：\n{user_id}"
+
+        if text in ("測試推播", "測試push", "測試 Push", "push測試"):
+            leave_photo_wait_if_any(user_id)
+            try:
+                await push_line_text(user_id, "推播測試成功：這則是用 Push API 送出的。")
+                return "Reply 正常。Push 測試也已送出；若你有收到上一則「推播測試成功」，代表分析結果推播通道正常。"
+            except Exception as e:
+                logger.error("測試推播失敗 user=%s: %s", user_id[:8], e, exc_info=True)
+                return (
+                    "Reply 正常，但 Push 失敗（餐點分析結果走 Push，所以會收不到）。\n"
+                    f"錯誤：{type(e).__name__}: {e}"
+                )
 
         if text in ("Notion狀態", "notion狀態", "Notion 狀態", "notion status", "Notion status"):
             leave_photo_wait_if_any(user_id)
